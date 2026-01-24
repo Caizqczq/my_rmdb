@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "record/rm.h"
 #include "record_printer.h"
+#include "system/sm_meta.h"
 
 /**
  * @description: 判断是否为一个文件夹
@@ -85,6 +86,28 @@ void SmManager::drop_db (const std::string& db_name) {
  * @param {string&} db_name 数据库名称，与文件夹同名
  */
 void SmManager::open_db (const std::string& db_name) {
+    if (!is_dir (db_name)) {
+        throw DatabaseNotFoundError (db_name);
+    }
+
+    if (chdir (db_name.c_str ()) < 0) {
+        throw UnixError ();
+    }
+
+    std::ifstream ifs (DB_META_NAME);
+    ifs >> db_;
+    for (auto& entry : db_.tabs_) {
+        auto& tab = entry.second;
+        fhs_.emplace (tab.name, rm_manager_->open_file (tab.name));
+    }
+
+    for (auto& entry : db_.tabs_) {
+        auto& tab = entry.second;
+        for (auto& index : tab.indexes) {
+            auto index_name = ix_manager_->get_index_name (tab.name, index.cols);
+            ihs_.emplace (index_name, ix_manager_->open_index (tab.name, index.cols));
+        }
+    }
 }
 
 /**
@@ -100,6 +123,15 @@ void SmManager::flush_meta () {
  * @description: 关闭数据库并把数据落盘
  */
 void SmManager::close_db () {
+    for (auto& entry : fhs_) {
+        rm_manager_->close_file (entry.second.get ());
+    }
+    fhs_.clear ();
+    for (auto& entry : ihs_) {
+        ix_manager_->close_index (entry.second.get ());
+    }
+    ihs_.clear ();
+    flush_meta ();
 }
 
 /**
@@ -186,6 +218,25 @@ void SmManager::create_table (const std::string& tab_name, const std::vector<Col
  * @param {Context*} context
  */
 void SmManager::drop_table (const std::string& tab_name, Context* context) {
+    if (!db_.is_table (tab_name)) {
+        throw TableNotFoundError (tab_name);
+    }
+    TabMeta& tab = db_.get_table (tab_name);
+
+    for (auto& index : tab.indexes) {
+        drop_index (tab_name, index.cols, context);
+    }
+    if (fhs_.find (tab_name) != fhs_.end ()) {
+        rm_manager_->close_file (fhs_[tab_name].get ());
+        fhs_[tab_name].reset ();
+        fhs_.erase (tab_name);
+    }
+
+    rm_manager_->destroy_file (tab_name);
+
+    db_.tabs_.erase (tab_name);
+
+    flush_meta ();
 }
 
 /**
