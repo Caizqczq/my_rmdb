@@ -15,16 +15,16 @@ See the Mulan PSL v2 for more details. */
 #include <memory>
 #include <string>
 #include <vector>
+
 #include "defs.h"
 #include "record/rm_defs.h"
-
 
 struct TabCol {
     std::string tab_name;
     std::string col_name;
 
-    friend bool operator<(const TabCol &x, const TabCol &y) {
-        return std::make_pair(x.tab_name, x.col_name) < std::make_pair(y.tab_name, y.col_name);
+    friend bool operator< (const TabCol &x, const TabCol &y) {
+        return std::make_pair (x.tab_name, x.col_name) < std::make_pair (y.tab_name, y.col_name);
     }
 };
 
@@ -38,36 +38,36 @@ struct Value {
 
     std::shared_ptr<RmRecord> raw;  // raw record buffer
 
-    void set_int(int int_val_) {
+    void set_int (int int_val_) {
         type = TYPE_INT;
         int_val = int_val_;
     }
 
-    void set_float(float float_val_) {
+    void set_float (float float_val_) {
         type = TYPE_FLOAT;
         float_val = float_val_;
     }
 
-    void set_str(std::string str_val_) {
+    void set_str (std::string str_val_) {
         type = TYPE_STRING;
-        str_val = std::move(str_val_);
+        str_val = std::move (str_val_);
     }
 
-    void init_raw(int len) {
-        assert(raw == nullptr);
-        raw = std::make_shared<RmRecord>(len);
+    void init_raw (int len) {
+        assert (raw == nullptr);
+        raw = std::make_shared<RmRecord> (len);
         if (type == TYPE_INT) {
-            assert(len == sizeof(int));
+            assert (len == sizeof (int));
             *(int *)(raw->data) = int_val;
         } else if (type == TYPE_FLOAT) {
-            assert(len == sizeof(float));
+            assert (len == sizeof (float));
             *(float *)(raw->data) = float_val;
         } else if (type == TYPE_STRING) {
-            if (len < (int)str_val.size()) {
-                throw StringOverflowError();
+            if (len < (int)str_val.size ()) {
+                throw StringOverflowError ();
             }
-            memset(raw->data, 0, len);
-            memcpy(raw->data, str_val.c_str(), str_val.size());
+            memset (raw->data, 0, len);
+            memcpy (raw->data, str_val.c_str (), str_val.size ());
         }
     }
 };

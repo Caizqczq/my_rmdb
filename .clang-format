@@ -12,6 +12,16 @@ AllowShortFunctionsOnASingleLine: None
 AllowShortIfStatementsOnASingleLine: Never
 SpaceBeforeParens: Always
 Standard:        Auto
-SortIncludes:    true
 BreakBeforeBraces: Attach
 UseTab:          Never
+SortIncludes:    true
+IncludeBlocks:   Regroup
+IncludeCategories:
+  - Regex:           '^<gtest/.*'
+    Priority:        4
+  - Regex:           '^<.*\.h>'
+    Priority:        1
+  - Regex:           '^<.*'
+    Priority:        2
+  - Regex:           '.*'
+    Priority:        3

@@ -10,16 +10,14 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
-#include <vector>
 #include <optional>
+#include <vector>
 
-
+#include "common/common.h"
 #include "transaction/transaction.h"
 #include "transaction/transaction_manager.h"
-#include "common/common.h"
 
-auto ReconstructTuple(const TabMeta *schema, const RmRecord &base_tuple, const TupleMeta &base_meta,
-                      const std::vector<UndoLog> &undo_logs) -> std::optional<RmRecord>;
+auto ReconstructTuple (const TabMeta *schema, const RmRecord &base_tuple, const TupleMeta &base_meta,
+                       const std::vector<UndoLog> &undo_logs) -> std::optional<RmRecord>;
 
-
-auto IsWriteWriteConflict(timestamp_t tuple_ts, Transaction *txn) -> bool;
+auto IsWriteWriteConflict (timestamp_t tuple_ts, Transaction *txn) -> bool;

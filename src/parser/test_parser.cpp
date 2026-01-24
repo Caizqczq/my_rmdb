@@ -13,7 +13,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "parser.h"
 
-int main() {
+int main () {
     std::vector<std::string> sqls = {
         "show tables;",
         "desc tb;",
@@ -36,16 +36,16 @@ int main() {
     };
     for (auto &sql : sqls) {
         std::cout << sql << std::endl;
-        YY_BUFFER_STATE buf = yy_scan_string(sql.c_str());
-        assert(yyparse() == 0);
+        YY_BUFFER_STATE buf = yy_scan_string (sql.c_str ());
+        assert (yyparse () == 0);
         if (ast::parse_tree != nullptr) {
-            ast::TreePrinter::print(ast::parse_tree);
-            yy_delete_buffer(buf);
+            ast::TreePrinter::print (ast::parse_tree);
+            yy_delete_buffer (buf);
             std::cout << std::endl;
         } else {
             std::cout << "exit/EOF" << std::endl;
         }
     }
-    ast::parse_tree.reset();
+    ast::parse_tree.reset ();
     return 0;
 }
