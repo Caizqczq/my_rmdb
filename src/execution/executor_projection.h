@@ -9,6 +9,8 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #pragma once
+#include <cstddef>
+
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
@@ -39,17 +41,44 @@ class ProjectionExecutor : public AbstractExecutor {
         len_ = curr_offset;
     }
 
+    const std::vector<ColMeta> &cols () const override {
+        return cols_;
+    }
+
+    size_t tupleLen () const override {
+        return len_;
+    }
+
     void beginTuple () override {
+        prev_->beginTuple ();
     }
 
     void nextTuple () override {
+        prev_->nextTuple ();
+    }
+
+    bool is_end () const override {
+        return prev_->is_end ();
     }
 
     std::unique_ptr<RmRecord> Next () override {
-        return nullptr;
+        if (prev_->is_end ()) {
+            return nullptr;
+        }
+
+        auto rec = prev_->Next ();
+        auto &prev_cols = prev_->cols ();
+
+        auto proj_rec = std::make_unique<RmRecord> (len_);
+        for (size_t i = 0; i < sel_idxs_.size (); i++) {
+            auto &col = cols_[i];
+            auto &prev_col = prev_cols[sel_idxs_[i]];
+            memcpy (proj_rec->data + col.offset, rec->data + prev_col.offset, col.len);
+        }
+        return proj_rec;
     }
 
     Rid &rid () override {
-        return _abstract_rid;
+        return prev_->rid ();
     }
 };

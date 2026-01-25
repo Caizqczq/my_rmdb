@@ -45,14 +45,93 @@ class SeqScanExecutor : public AbstractExecutor {
         fed_conds_ = conds_;
     }
 
+    const std::vector<ColMeta> &cols () const override {
+        return cols_;
+    }
+
+    size_t tupleLen () const override {
+        return len_;
+    }
+
     void beginTuple () override {
+        scan_ = std::make_unique<RmScan> (fh_);
+        find_next_valid ();
     }
 
     void nextTuple () override {
+        if (is_end ()) {
+            return;
+        }
+        scan_->next ();
+        find_next_valid ();
+    }
+
+    bool is_end () const override {
+        return !scan_ || scan_->is_end ();
     }
 
     std::unique_ptr<RmRecord> Next () override {
-        return nullptr;
+        if (is_end ()) {
+            return nullptr;
+        }
+        return fh_->get_record (rid_, context_);
+    }
+
+    private:
+    void find_next_valid () {
+        while (!scan_->is_end ()) {
+            rid_ = scan_->rid ();
+            auto rec = fh_->get_record (rid_, context_);
+            if (check_conds (rec.get ())) {
+                return;
+            }
+            scan_->next ();
+        }
+    }
+
+    bool check_conds (RmRecord *rec) {
+        for (auto &cond : fed_conds_) {
+            auto lhs_col = get_col (cols_, cond.lhs_col);
+            char *lhs_data = rec->data + lhs_col->offset;
+
+            char *rhs_data;
+            if (cond.is_rhs_val) {
+                auto &val = const_cast<Value &> (cond.rhs_val);
+                if (!val.raw)
+                    val.init_raw (lhs_col->len);
+                rhs_data = val.raw->data;
+            } else {
+                auto rhs_col = get_col (cols_, cond.rhs_col);
+                rhs_data = rec->data + rhs_col->offset;
+            }
+
+            int cmp = ix_compare (lhs_data, rhs_data, lhs_col->type, lhs_col->len);
+
+            bool ok = false;
+            switch (cond.op) {
+                case OP_EQ:
+                    ok = (cmp == 0);
+                    break;
+                case OP_NE:
+                    ok = (cmp != 0);
+                    break;
+                case OP_LT:
+                    ok = (cmp < 0);
+                    break;
+                case OP_GT:
+                    ok = (cmp > 0);
+                    break;
+                case OP_LE:
+                    ok = (cmp <= 0);
+                    break;
+                case OP_GE:
+                    ok = (cmp >= 0);
+                    break;
+            }
+            if (!ok)
+                return false;
+        }
+        return true;
     }
 
     Rid &rid () override {
