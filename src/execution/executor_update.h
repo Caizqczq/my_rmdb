@@ -38,6 +38,45 @@ class UpdateExecutor : public AbstractExecutor {
         context_ = context;
     }
     std::unique_ptr<RmRecord> Next () override {
+        for (auto &rid : rids_) {
+            auto record = fh_->get_record (rid, context_);
+
+            for (auto &index : tab_.indexes) {
+                auto ix_handle =
+                    sm_manager_->ihs_.at (sm_manager_->get_ix_manager ()->get_index_name (tab_name_, index.cols))
+                        .get ();
+                char *key = new char[index.col_tot_len];
+                int offset = 0;
+                for (size_t i = 0; i < index.col_num; ++i) {
+                    memcpy (key + offset, record->data + index.cols[i].offset, index.cols[i].len);
+                    offset += index.cols[i].len;
+                }
+                ix_handle->delete_entry (key, context_->txn_);
+                delete[] key;
+            }
+
+            for (auto &clause : set_clauses_) {
+                auto col = tab_.get_col (clause.lhs.col_name);
+                auto &val = clause.rhs;
+                memcpy (record->data + col->offset, val.raw->data, col->len);
+            }
+
+            fh_->update_record (rid, record->data, context_);
+
+            for (auto &index : tab_.indexes) {
+                auto ix_handle =
+                    sm_manager_->ihs_.at (sm_manager_->get_ix_manager ()->get_index_name (tab_name_, index.cols))
+                        .get ();
+                char *key = new char[index.col_tot_len];
+                int offset = 0;
+                for (size_t i = 0; i < index.col_num; ++i) {
+                    memcpy (key + offset, record->data + index.cols[i].offset, index.cols[i].len);
+                    offset += index.cols[i].len;
+                }
+                ix_handle->insert_entry (key, rid, context_->txn_);
+                delete[] key;
+            }
+        }
         return nullptr;
     }
 

@@ -58,7 +58,11 @@ std::shared_ptr<Query> Analyze::do_analyze (std::shared_ptr<ast::TreeNode> parse
             set_clause.lhs = {.tab_name = x->tab_name, .col_name = sv_set_clause->col_name};
             set_clause.rhs = convert_sv_value (sv_set_clause->val);
             auto col = tab.get_col (sv_set_clause->col_name);
-            if (col->type != set_clause.rhs.type) {
+            if (col->type == TYPE_FLOAT && set_clause.rhs.type == TYPE_INT) {
+                set_clause.rhs.set_float (static_cast<float> (set_clause.rhs.int_val));
+            } else if (col->type == TYPE_INT && set_clause.rhs.type == TYPE_FLOAT) {
+                set_clause.rhs.set_int (static_cast<int> (set_clause.rhs.float_val));
+            } else if (col->type != set_clause.rhs.type) {
                 throw IncompatibleTypeError (coltype2str (col->type), coltype2str (set_clause.rhs.type));
             }
             set_clause.rhs.init_raw (col->len);
@@ -156,8 +160,16 @@ void Analyze::check_clause (const std::vector<std::string> &tab_names, std::vect
         ColType lhs_type = lhs_col->type;
         ColType rhs_type;
         if (cond.is_rhs_val) {
-            cond.rhs_val.init_raw (lhs_col->len);
             rhs_type = cond.rhs_val.type;
+            // INT/FLOAT 隐式转换
+            if (lhs_type == TYPE_FLOAT && rhs_type == TYPE_INT) {
+                cond.rhs_val.set_float (static_cast<float> (cond.rhs_val.int_val));
+                rhs_type = TYPE_FLOAT;
+            } else if (lhs_type == TYPE_INT && rhs_type == TYPE_FLOAT) {
+                cond.rhs_val.set_int (static_cast<int> (cond.rhs_val.float_val));
+                rhs_type = TYPE_INT;
+            }
+            cond.rhs_val.init_raw (lhs_col->len);
         } else {
             TabMeta &rhs_tab = sm_manager_->db_.get_table (cond.rhs_col.tab_name);
             auto rhs_col = rhs_tab.get_col (cond.rhs_col.col_name);
