@@ -20,7 +20,11 @@ std::shared_ptr<Query> Analyze::do_analyze (std::shared_ptr<ast::TreeNode> parse
     if (auto x = std::dynamic_pointer_cast<ast::SelectStmt> (parse)) {
         // 处理表名
         query->tables = std::move (x->tabs);
-        /** TODO: 检查表是否存在 */
+        for (auto &tab_name : query->tables) {
+            if (!sm_manager_->db_.is_table (tab_name)) {
+                throw TableNotFoundError (tab_name);
+            }
+        }
 
         // 处理target list，再target list中添加上表名，例如 a.id
         for (auto &sv_sel_col : x->cols) {
@@ -46,7 +50,22 @@ std::shared_ptr<Query> Analyze::do_analyze (std::shared_ptr<ast::TreeNode> parse
         get_clause (x->conds, query->conds);
         check_clause (query->tables, query->conds);
     } else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt> (parse)) {
-        /** TODO: */
+        query->tables = {x->tab_name};
+        TabMeta &tab = sm_manager_->db_.get_table (x->tab_name);
+        query->set_clauses.reserve (x->set_clauses.size ());
+        for (auto &sv_set_clause : x->set_clauses) {
+            SetClause set_clause;
+            set_clause.lhs = {.tab_name = x->tab_name, .col_name = sv_set_clause->col_name};
+            set_clause.rhs = convert_sv_value (sv_set_clause->val);
+            auto col = tab.get_col (sv_set_clause->col_name);
+            if (col->type != set_clause.rhs.type) {
+                throw IncompatibleTypeError (coltype2str (col->type), coltype2str (set_clause.rhs.type));
+            }
+            set_clause.rhs.init_raw (col->len);
+            query->set_clauses.push_back (std::move (set_clause));
+        }
+        get_clause (x->conds, query->conds);
+        check_clause ({x->tab_name}, query->conds);
 
     } else if (auto x = std::dynamic_pointer_cast<ast::DeleteStmt> (parse)) {
         // 处理where条件
@@ -81,7 +100,16 @@ TabCol Analyze::check_column (const std::vector<ColMeta> &all_cols, TabCol targe
         }
         target.tab_name = tab_name;
     } else {
-        /** TODO: Make sure target column exists */
+        bool found = false;
+        for (auto &col : all_cols) {
+            if (col.tab_name == target.tab_name && col.name == target.col_name) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            throw ColumnNotFoundError (target.col_name);
+        }
     }
     return target;
 }
