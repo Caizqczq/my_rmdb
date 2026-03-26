@@ -23,6 +23,7 @@ typedef enum PlanTag {
     T_Invalid = 1,
     T_Help,
     T_ShowTable,
+    T_ShowIndex,
     T_DescTable,
     T_CreateTable,
     T_DropTable,
@@ -55,7 +56,7 @@ class Plan {
 class ScanPlan : public Plan {
     public:
     ScanPlan (PlanTag tag, SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds,
-              std::vector<std::string> index_col_names) {
+              std::vector<std::string> index_col_names, std::vector<IndexRange> index_ranges = {}) {
         Plan::tag = tag;
         tab_name_ = std::move (tab_name);
         conds_ = std::move (conds);
@@ -64,6 +65,7 @@ class ScanPlan : public Plan {
         len_ = cols_.back ().offset + cols_.back ().len;
         fed_conds_ = conds_;
         index_col_names_ = index_col_names;
+        index_ranges_ = std::move (index_ranges);
     }
     ~ScanPlan () {
     }
@@ -74,6 +76,7 @@ class ScanPlan : public Plan {
     size_t len_;
     std::vector<Condition> fed_conds_;
     std::vector<std::string> index_col_names_;
+    std::vector<IndexRange> index_ranges_;
 };
 
 class JoinPlan : public Plan {

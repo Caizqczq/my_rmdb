@@ -26,6 +26,7 @@ const char *help_info =
     "command:\n"
     "  CREATE TABLE table_name (column_name type [, column_name type ...])\n"
     "  DROP TABLE table_name\n"
+    "  SHOW INDEX FROM table_name\n"
     "  CREATE INDEX table_name (column_name)\n"
     "  DROP INDEX table_name (column_name)\n"
     "  INSERT INTO table_name VALUES (value [, value ...])\n"
@@ -83,6 +84,10 @@ void QlManager::run_cmd_utility (std::shared_ptr<Plan> plan, txn_id_t *txn_id, C
             }
             case T_ShowTable: {
                 sm_manager_->show_tables (context);
+                break;
+            }
+            case T_ShowIndex: {
+                sm_manager_->show_index (x->tab_name_, context);
                 break;
             }
             case T_DescTable: {

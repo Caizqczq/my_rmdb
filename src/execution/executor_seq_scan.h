@@ -90,48 +90,7 @@ class SeqScanExecutor : public AbstractExecutor {
     }
 
     bool check_conds (RmRecord *rec) {
-        for (auto &cond : fed_conds_) {
-            auto lhs_col = get_col (cols_, cond.lhs_col);
-            char *lhs_data = rec->data + lhs_col->offset;
-
-            char *rhs_data;
-            if (cond.is_rhs_val) {
-                auto &val = const_cast<Value &> (cond.rhs_val);
-                if (!val.raw)
-                    val.init_raw (lhs_col->len);
-                rhs_data = val.raw->data;
-            } else {
-                auto rhs_col = get_col (cols_, cond.rhs_col);
-                rhs_data = rec->data + rhs_col->offset;
-            }
-
-            int cmp = ix_compare (lhs_data, rhs_data, lhs_col->type, lhs_col->len);
-
-            bool ok = false;
-            switch (cond.op) {
-                case OP_EQ:
-                    ok = (cmp == 0);
-                    break;
-                case OP_NE:
-                    ok = (cmp != 0);
-                    break;
-                case OP_LT:
-                    ok = (cmp < 0);
-                    break;
-                case OP_GT:
-                    ok = (cmp > 0);
-                    break;
-                case OP_LE:
-                    ok = (cmp <= 0);
-                    break;
-                case OP_GE:
-                    ok = (cmp >= 0);
-                    break;
-            }
-            if (!ok)
-                return false;
-        }
-        return true;
+        return evaluate_conditions (cols_, rec, fed_conds_);
     }
 
     Rid &rid () override {
