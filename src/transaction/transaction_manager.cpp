@@ -10,10 +10,85 @@ See the Mulan PSL v2 for more details. */
 
 #include "transaction_manager.h"
 
+#include <memory>
+#include <vector>
+
 #include "record/rm_file_handle.h"
 #include "system/sm_manager.h"
 
 std::unordered_map<txn_id_t, Transaction*> TransactionManager::txn_map = {};
+
+namespace {
+
+void delete_write_records(const std::shared_ptr<std::deque<WriteRecord *>> &write_set) {
+    if (write_set == nullptr) {
+        return;
+    }
+    for (auto *write_record : *write_set) {
+        delete write_record;
+    }
+    write_set->clear();
+}
+
+void release_locks(Transaction *txn, LockManager *lock_manager) {
+    if (txn == nullptr || lock_manager == nullptr) {
+        return;
+    }
+    auto lock_set = txn->get_lock_set();
+    if (lock_set == nullptr) {
+        return;
+    }
+    std::vector<LockDataId> locks(lock_set->begin(), lock_set->end());
+    for (const auto &lock_data_id : locks) {
+        lock_manager->unlock(txn, lock_data_id);
+    }
+    lock_set->clear();
+}
+
+void clear_txn_resources(Transaction *txn) {
+    if (txn == nullptr) {
+        return;
+    }
+    if (auto index_latch_page_set = txn->get_index_latch_page_set(); index_latch_page_set != nullptr) {
+        index_latch_page_set->clear();
+    }
+    if (auto index_deleted_page_set = txn->get_index_deleted_page_set(); index_deleted_page_set != nullptr) {
+        index_deleted_page_set->clear();
+    }
+}
+
+std::unique_ptr<char[]> make_index_key(const IndexMeta &index, const RmRecord &record) {
+    auto key = std::make_unique<char[]>(index.col_tot_len);
+    int offset = 0;
+    for (size_t i = 0; i < index.col_num; ++i) {
+        memcpy(key.get() + offset, record.data + index.cols[i].offset, index.cols[i].len);
+        offset += index.cols[i].len;
+    }
+    return key;
+}
+
+void delete_index_entry(SmManager *sm_manager, const std::string &tab_name, const RmRecord &record, Transaction *txn) {
+    auto &tab = sm_manager->db_.get_table(tab_name);
+    for (auto &index : tab.indexes) {
+        auto index_name = sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols);
+        auto ih = sm_manager->ihs_.at(index_name).get();
+        auto key = make_index_key(index, record);
+        ih->delete_entry(key.get(), txn);
+    }
+}
+
+void insert_index_entry(SmManager *sm_manager, const std::string &tab_name, const RmRecord &record, const Rid &rid,
+                        Transaction *txn) {
+    auto &tab = sm_manager->db_.get_table(tab_name);
+    for (auto &index : tab.indexes) {
+        auto index_name = sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols);
+        auto ih = sm_manager->ihs_.at(index_name).get();
+        auto key = make_index_key(index, record);
+        ih->insert_entry(key.get(), rid, txn);
+    }
+}
+
+}  // namespace
 
 /**
  * @description: 事务的开始方法
@@ -22,14 +97,16 @@ std::unordered_map<txn_id_t, Transaction*> TransactionManager::txn_map = {};
  * @param {LogManager*} log_manager 日志管理器指针
  */
 Transaction* TransactionManager::begin (Transaction* txn, LogManager* log_manager) {
-    // Todo:
-    // 1. 判断传入事务参数是否为空指针
-    // 2. 如果为空指针，创建新事务
-    // 3. 把开始事务加入到全局事务表中
-    // 4. 返回当前事务指针
-    // 如果需要支持MVCC请在上述过程中添加代码
+    std::lock_guard<std::mutex> guard(latch_);
 
-    return nullptr;
+    if (txn == nullptr) {
+        txn = new Transaction(next_txn_id_++);
+    }
+
+    txn->set_state(TransactionState::GROWING);
+    txn->set_start_ts(next_timestamp_++);
+    TransactionManager::txn_map[txn->get_transaction_id()] = txn;
+    return txn;
 }
 
 /**
@@ -38,13 +115,19 @@ Transaction* TransactionManager::begin (Transaction* txn, LogManager* log_manage
  * @param {LogManager*} log_manager 日志管理器指针
  */
 void TransactionManager::commit (Transaction* txn, LogManager* log_manager) {
-    // Todo:
-    // 1. 如果存在未提交的写操作，提交所有的写操作
-    // 2. 释放所有锁
-    // 3. 释放事务相关资源，eg.锁集
-    // 4. 把事务日志刷入磁盘中
-    // 5. 更新事务状态
-    // 如果需要支持MVCC请在上述过程中添加代码
+    if (txn == nullptr) {
+        return;
+    }
+
+    delete_write_records(txn->get_write_set());
+    release_locks(txn, lock_manager_);
+    clear_txn_resources(txn);
+
+    if (log_manager != nullptr) {
+        log_manager->flush_log_to_disk();
+    }
+
+    txn->set_state(TransactionState::COMMITTED);
 }
 
 /**
@@ -53,11 +136,57 @@ void TransactionManager::commit (Transaction* txn, LogManager* log_manager) {
  * @param {LogManager} *log_manager 日志管理器指针
  */
 void TransactionManager::abort (Transaction* txn, LogManager* log_manager) {
-    // Todo:
-    // 1. 回滚所有写操作
-    // 2. 释放所有锁
-    // 3. 清空事务相关资源，eg.锁集
-    // 4. 把事务日志刷入磁盘中
-    // 5. 更新事务状态
-    // 如果需要支持MVCC请在上述过程中添加代码
+    if (txn == nullptr) {
+        return;
+    }
+
+    auto write_set = txn->get_write_set();
+    if (write_set != nullptr) {
+        for (auto it = write_set->rbegin(); it != write_set->rend(); ++it) {
+            auto *write_record = *it;
+            auto fh_it = sm_manager_->fhs_.find(write_record->GetTableName());
+            if (fh_it == sm_manager_->fhs_.end()) {
+                continue;
+            }
+
+            auto *fh = fh_it->second.get();
+            auto &rid = write_record->GetRid();
+            auto &record = write_record->GetRecord();
+
+            switch (write_record->GetWriteType()) {
+                case WType::INSERT_TUPLE: {
+                    auto inserted_record = fh->get_record(rid, nullptr);
+                    if (inserted_record != nullptr) {
+                        delete_index_entry(sm_manager_, write_record->GetTableName(), *inserted_record, txn);
+                        fh->delete_record(rid, nullptr);
+                    }
+                    break;
+                }
+                case WType::DELETE_TUPLE: {
+                    fh->insert_record(rid, record.data);
+                    insert_index_entry(sm_manager_, write_record->GetTableName(), record, rid, txn);
+                    break;
+                }
+                case WType::UPDATE_TUPLE: {
+                    auto current_record = fh->get_record(rid, nullptr);
+                    if (current_record != nullptr) {
+                        delete_index_entry(sm_manager_, write_record->GetTableName(), *current_record, txn);
+                    }
+                    fh->update_record(rid, record.data, nullptr);
+                    insert_index_entry(sm_manager_, write_record->GetTableName(), record, rid, txn);
+                    break;
+                }
+            }
+        }
+    }
+
+    delete_write_records(write_set);
+    release_locks(txn, lock_manager_);
+    clear_txn_resources(txn);
+
+    if (log_manager != nullptr) {
+        log_manager->flush_log_to_disk();
+    }
+
+    txn->set_state(TransactionState::ABORTED);
 }
