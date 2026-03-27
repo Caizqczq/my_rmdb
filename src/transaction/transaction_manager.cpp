@@ -57,37 +57,6 @@ void clear_txn_resources(Transaction *txn) {
     }
 }
 
-std::unique_ptr<char[]> make_index_key(const IndexMeta &index, const RmRecord &record) {
-    auto key = std::make_unique<char[]>(index.col_tot_len);
-    int offset = 0;
-    for (size_t i = 0; i < index.col_num; ++i) {
-        memcpy(key.get() + offset, record.data + index.cols[i].offset, index.cols[i].len);
-        offset += index.cols[i].len;
-    }
-    return key;
-}
-
-void delete_index_entry(SmManager *sm_manager, const std::string &tab_name, const RmRecord &record, Transaction *txn) {
-    auto &tab = sm_manager->db_.get_table(tab_name);
-    for (auto &index : tab.indexes) {
-        auto index_name = sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols);
-        auto ih = sm_manager->ihs_.at(index_name).get();
-        auto key = make_index_key(index, record);
-        ih->delete_entry(key.get(), txn);
-    }
-}
-
-void insert_index_entry(SmManager *sm_manager, const std::string &tab_name, const RmRecord &record, const Rid &rid,
-                        Transaction *txn) {
-    auto &tab = sm_manager->db_.get_table(tab_name);
-    for (auto &index : tab.indexes) {
-        auto index_name = sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols);
-        auto ih = sm_manager->ihs_.at(index_name).get();
-        auto key = make_index_key(index, record);
-        ih->insert_entry(key.get(), rid, txn);
-    }
-}
-
 }  // namespace
 
 /**
@@ -144,39 +113,7 @@ void TransactionManager::abort (Transaction* txn, LogManager* log_manager) {
     if (write_set != nullptr) {
         for (auto it = write_set->rbegin(); it != write_set->rend(); ++it) {
             auto *write_record = *it;
-            auto fh_it = sm_manager_->fhs_.find(write_record->GetTableName());
-            if (fh_it == sm_manager_->fhs_.end()) {
-                continue;
-            }
-
-            auto *fh = fh_it->second.get();
-            auto &rid = write_record->GetRid();
-            auto &record = write_record->GetRecord();
-
-            switch (write_record->GetWriteType()) {
-                case WType::INSERT_TUPLE: {
-                    auto inserted_record = fh->get_record(rid, nullptr);
-                    if (inserted_record != nullptr) {
-                        delete_index_entry(sm_manager_, write_record->GetTableName(), *inserted_record, txn);
-                        fh->delete_record(rid, nullptr);
-                    }
-                    break;
-                }
-                case WType::DELETE_TUPLE: {
-                    fh->insert_record(rid, record.data);
-                    insert_index_entry(sm_manager_, write_record->GetTableName(), record, rid, txn);
-                    break;
-                }
-                case WType::UPDATE_TUPLE: {
-                    auto current_record = fh->get_record(rid, nullptr);
-                    if (current_record != nullptr) {
-                        delete_index_entry(sm_manager_, write_record->GetTableName(), *current_record, txn);
-                    }
-                    fh->update_record(rid, record.data, nullptr);
-                    insert_index_entry(sm_manager_, write_record->GetTableName(), record, rid, txn);
-                    break;
-                }
-            }
+            sm_manager_->rollback_write(write_record, txn);
         }
     }
 

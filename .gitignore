@@ -67,3 +67,4 @@ Makefile
 *.temp
 
 tests/
+测试说明文档.md

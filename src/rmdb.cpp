@@ -122,16 +122,46 @@ void *client_handler (void *sock_fd) {
 
         // 用于判断是否已经调用了yy_delete_buffer来删除buf
         bool finish_analyze = false;
+        bool buffer_locked = false;
+        bool buffer_deleted = false;
         pthread_mutex_lock (buffer_mutex);
+        buffer_locked = true;
         YY_BUFFER_STATE buf = yy_scan_string (data_recv);
+        auto cleanup_parse_state = [&]() {
+            if (!buffer_deleted) {
+                yy_delete_buffer (buf);
+                buffer_deleted = true;
+            }
+            if (buffer_locked) {
+                pthread_mutex_unlock (buffer_mutex);
+                buffer_locked = false;
+            }
+        };
+        auto txn_is_active = [&](Transaction *txn) {
+            return txn != nullptr && txn->get_state () != TransactionState::COMMITTED &&
+                   txn->get_state () != TransactionState::ABORTED;
+        };
+        auto finish_implicit_txn = [&](bool should_commit) {
+            if (context->txn_ == nullptr || context->txn_->get_txn_mode () != false || !txn_is_active (context->txn_)) {
+                return;
+            }
+            if (should_commit) {
+                txn_manager->commit (context->txn_, context->log_mgr_);
+            } else {
+                txn_manager->abort (context->txn_, log_manager.get ());
+            }
+        };
         if (yyparse () == 0) {
             if (ast::parse_tree != nullptr) {
+                bool should_commit = true;
                 try {
                     // analyze and rewrite
                     std::shared_ptr<Query> query = analyze->do_analyze (ast::parse_tree);
                     yy_delete_buffer (buf);
+                    buffer_deleted = true;
                     finish_analyze = true;
                     pthread_mutex_unlock (buffer_mutex);
+                    buffer_locked = false;
                     // 优化器
                     std::shared_ptr<Plan> plan = optimizer->plan_query (query, context);
                     // portal
@@ -139,14 +169,18 @@ void *client_handler (void *sock_fd) {
                     portal->run (portalStmt, ql_manager.get (), &txn_id, context);
                     portal->drop ();
                 } catch (TransactionAbortException &e) {
+                    cleanup_parse_state ();
                     // 事务需要回滚，需要把abort信息返回给客户端并写入output.txt文件中
                     std::string str = "abort\n";
                     memcpy (data_send, str.c_str (), str.length ());
                     data_send[str.length ()] = '\0';
                     offset = str.length ();
+                    should_commit = false;
 
                     // 回滚事务
-                    txn_manager->abort (context->txn_, log_manager.get ());
+                    if (txn_is_active (context->txn_)) {
+                        txn_manager->abort (context->txn_, log_manager.get ());
+                    }
                     std::cout << e.GetInfo () << std::endl;
 
                     std::fstream outfile;
@@ -154,6 +188,7 @@ void *client_handler (void *sock_fd) {
                     outfile << str;
                     outfile.close ();
                 } catch (RMDBError &e) {
+                    cleanup_parse_state ();
                     // 遇到异常，需要打印failure到output.txt文件中，并发异常信息返回给客户端
                     std::cerr << e.what () << std::endl;
 
@@ -161,6 +196,11 @@ void *client_handler (void *sock_fd) {
                     data_send[e.get_msg_len ()] = '\n';
                     data_send[e.get_msg_len () + 1] = '\0';
                     offset = e.get_msg_len () + 1;
+                    should_commit = false;
+
+                    if (context->txn_ != nullptr && context->txn_->get_txn_mode () == false && txn_is_active (context->txn_)) {
+                        txn_manager->abort (context->txn_, log_manager.get ());
+                    }
 
                     // 将报错信息写入output.txt
                     std::fstream outfile;
@@ -168,20 +208,23 @@ void *client_handler (void *sock_fd) {
                     outfile << "failure\n";
                     outfile.close ();
                 }
+                if (write (fd, data_send, offset + 1) == -1) {
+                    break;
+                }
+                if (should_commit) {
+                    finish_implicit_txn (true);
+                }
+                continue;
             }
         }
         if (finish_analyze == false) {
-            yy_delete_buffer (buf);
-            pthread_mutex_unlock (buffer_mutex);
+            cleanup_parse_state ();
         }
+        finish_implicit_txn (false);
         // future TODO: 格式化 sql_handler.result, 传给客户端
         // send result with fixed format, use protobuf in the future
         if (write (fd, data_send, offset + 1) == -1) {
             break;
-        }
-        // 如果是单挑语句，需要按照一个完整的事务来执行，所以执行完当前语句后，自动提交事务
-        if (context->txn_->get_txn_mode () == false) {
-            txn_manager->commit (context->txn_, context->log_mgr_);
         }
     }
 

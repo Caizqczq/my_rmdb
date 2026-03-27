@@ -14,6 +14,8 @@ See the Mulan PSL v2 for more details. */
 #include <unistd.h>
 
 #include <fstream>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "index/ix.h"
 #include "record/rm.h"
@@ -50,6 +52,75 @@ std::string format_index_columns(const std::vector<ColMeta>& cols) {
     }
     result += ")";
     return result;
+}
+
+IxIndexHandle* get_index_handle(SmManager* sm_manager, const std::string& tab_name, const IndexMeta& index) {
+    auto index_name = sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols);
+    return sm_manager->ihs_.at(index_name).get();
+}
+
+int64_t rid_to_token(const Rid& rid) {
+    return (static_cast<int64_t>(rid.page_no) << 32) | static_cast<uint32_t>(rid.slot_no);
+}
+
+void ensure_unique_key_available(IxIndexHandle* ih, const char* key, Transaction* txn,
+                                 const std::unordered_set<int64_t>& ignored_rids) {
+    std::vector<Rid> result;
+    if (!ih->get_value(key, &result, txn)) {
+        return;
+    }
+    for (const auto& rid : result) {
+        int64_t rid_token = rid_to_token(rid);
+        if (ignored_rids.count(rid_token) == 0) {
+            throw RMDBError("Duplicate key for unique index");
+        }
+    }
+}
+
+void delete_index_entries(SmManager* sm_manager, const std::string& tab_name, const TabMeta& tab, const RmRecord& record,
+                          Transaction* txn) {
+    for (const auto& index : tab.indexes) {
+        auto key = build_index_key(index, record);
+        get_index_handle(sm_manager, tab_name, index)->delete_entry(key.get(), txn);
+    }
+}
+
+void insert_index_entries(SmManager* sm_manager, const std::string& tab_name, const TabMeta& tab, const RmRecord& record,
+                          const Rid& rid, Transaction* txn) {
+    for (const auto& index : tab.indexes) {
+        auto key = build_index_key(index, record);
+        get_index_handle(sm_manager, tab_name, index)->insert_entry(key.get(), rid, txn);
+    }
+}
+
+struct UpdatePlan {
+    Rid rid;
+    RmRecord old_record;
+    RmRecord new_record;
+    std::vector<std::unique_ptr<char[]>> old_keys;
+    std::vector<std::unique_ptr<char[]>> new_keys;
+
+    UpdatePlan(UpdatePlan&&) = default;
+    UpdatePlan& operator=(UpdatePlan&&) = default;
+    UpdatePlan(const UpdatePlan&) = delete;
+    UpdatePlan& operator=(const UpdatePlan&) = delete;
+};
+
+UpdatePlan build_update_plan(const std::string& tab_name, const TabMeta& tab, RmFileHandle* fh, const Rid& rid,
+                             const RmRecord& new_record, Context* context) {
+    auto old_record = fh->get_record(rid, context);
+    if (old_record == nullptr) {
+        throw RMDBError("Record not found");
+    }
+
+    UpdatePlan plan{rid, *old_record, new_record, {}, {}};
+    plan.old_keys.reserve(tab.indexes.size());
+    plan.new_keys.reserve(tab.indexes.size());
+    for (const auto& index : tab.indexes) {
+        plan.old_keys.push_back(build_index_key(index, plan.old_record));
+        plan.new_keys.push_back(build_index_key(index, plan.new_record));
+    }
+    return plan;
 }
 
 }  // namespace
@@ -385,5 +456,161 @@ void SmManager::drop_index (const std::string& tab_name, const std::vector<ColMe
         names.push_back (col.name);
     }
     drop_index (tab_name, names, context);
+}
+
+Rid SmManager::insert_tuple(const std::string& tab_name, const RmRecord& record, Context* context) {
+    TabMeta& tab = db_.get_table(tab_name);
+    auto* fh = fhs_.at(tab_name).get();
+
+    std::vector<std::unique_ptr<char[]>> index_keys;
+    index_keys.reserve(tab.indexes.size());
+    static const std::unordered_set<int64_t> ignored_rids;
+    for (const auto& index : tab.indexes) {
+        auto key = build_index_key(index, record);
+        ensure_unique_key_available(get_index_handle(this, tab_name, index), key.get(),
+                                    context ? context->txn_ : nullptr, ignored_rids);
+        index_keys.push_back(std::move(key));
+    }
+
+    Rid rid = fh->insert_record(record.data, context);
+    if (context != nullptr && context->txn_ != nullptr) {
+        context->txn_->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab_name, rid));
+    }
+
+    for (size_t i = 0; i < tab.indexes.size(); ++i) {
+        get_index_handle(this, tab_name, tab.indexes[i])->insert_entry(index_keys[i].get(), rid,
+                                                                       context ? context->txn_ : nullptr);
+    }
+    return rid;
+}
+
+void SmManager::delete_tuple(const std::string& tab_name, const Rid& rid, Context* context) {
+    TabMeta& tab = db_.get_table(tab_name);
+    auto* fh = fhs_.at(tab_name).get();
+    auto record = fh->get_record(rid, context);
+    if (record == nullptr) {
+        return;
+    }
+
+    if (context != nullptr && context->txn_ != nullptr) {
+        context->txn_->append_write_record(new WriteRecord(WType::DELETE_TUPLE, tab_name, rid, *record));
+    }
+
+    delete_index_entries(this, tab_name, tab, *record, context ? context->txn_ : nullptr);
+    fh->delete_record(rid, context);
+}
+
+void SmManager::update_tuple(const std::string& tab_name, const Rid& rid, const RmRecord& record, Context* context) {
+    update_tuples(tab_name, {{rid, record}}, context);
+}
+
+void SmManager::update_tuples(const std::string& tab_name, const std::vector<std::pair<Rid, RmRecord>>& records,
+                              Context* context) {
+    if (records.empty()) {
+        return;
+    }
+
+    TabMeta& tab = db_.get_table(tab_name);
+    auto* fh = fhs_.at(tab_name).get();
+
+    std::vector<UpdatePlan> plans;
+    plans.reserve(records.size());
+
+    std::unordered_set<int64_t> target_rids;
+    target_rids.reserve(records.size());
+    for (const auto& [rid, record] : records) {
+        int64_t rid_token = rid_to_token(rid);
+        target_rids.insert(rid_token);
+        plans.push_back(build_update_plan(tab_name, tab, fh, rid, record, context));
+    }
+
+    for (size_t index_no = 0; index_no < tab.indexes.size(); ++index_no) {
+        const auto& index = tab.indexes[index_no];
+        auto* ih = get_index_handle(this, tab_name, index);
+        std::unordered_map<std::string, int64_t> final_keys;
+        final_keys.reserve(plans.size());
+
+        for (const auto& plan : plans) {
+            std::string final_key(plan.new_keys[index_no].get(), index.col_tot_len);
+            int64_t rid_token = rid_to_token(plan.rid);
+            auto [it, inserted] = final_keys.emplace(final_key, rid_token);
+            if (!inserted && it->second != rid_token) {
+                throw RMDBError("Duplicate key for unique index");
+            }
+        }
+
+        for (const auto& plan : plans) {
+            ensure_unique_key_available(ih, plan.new_keys[index_no].get(), context ? context->txn_ : nullptr,
+                                        target_rids);
+        }
+    }
+
+    for (auto& plan : plans) {
+        if (context != nullptr && context->txn_ != nullptr) {
+            context->txn_->append_write_record(new WriteRecord(WType::UPDATE_TUPLE, tab_name, plan.rid, plan.old_record));
+        }
+
+        for (size_t index_no = 0; index_no < tab.indexes.size(); ++index_no) {
+            const auto& index = tab.indexes[index_no];
+            if (memcmp(plan.old_keys[index_no].get(), plan.new_keys[index_no].get(), index.col_tot_len) == 0) {
+                continue;
+            }
+            get_index_handle(this, tab_name, index)->delete_entry(plan.old_keys[index_no].get(),
+                                                                  context ? context->txn_ : nullptr);
+        }
+
+        fh->update_record(plan.rid, plan.new_record.data, context);
+
+        for (size_t index_no = 0; index_no < tab.indexes.size(); ++index_no) {
+            const auto& index = tab.indexes[index_no];
+            if (memcmp(plan.old_keys[index_no].get(), plan.new_keys[index_no].get(), index.col_tot_len) == 0) {
+                continue;
+            }
+            get_index_handle(this, tab_name, index)->insert_entry(plan.new_keys[index_no].get(), plan.rid,
+                                                                  context ? context->txn_ : nullptr);
+        }
+    }
+}
+
+void SmManager::rollback_write(WriteRecord* write_record, Transaction* txn) {
+    if (write_record == nullptr) {
+        return;
+    }
+
+    const auto& tab_name = write_record->GetTableName();
+    auto fh_it = fhs_.find(tab_name);
+    if (fh_it == fhs_.end()) {
+        return;
+    }
+
+    auto* fh = fh_it->second.get();
+    auto& tab = db_.get_table(tab_name);
+    auto& rid = write_record->GetRid();
+    auto& record = write_record->GetRecord();
+
+    switch (write_record->GetWriteType()) {
+        case WType::INSERT_TUPLE: {
+            auto inserted_record = fh->get_record(rid, nullptr);
+            if (inserted_record != nullptr) {
+                delete_index_entries(this, tab_name, tab, *inserted_record, txn);
+                fh->delete_record(rid, nullptr);
+            }
+            break;
+        }
+        case WType::DELETE_TUPLE: {
+            fh->insert_record(rid, record.data);
+            insert_index_entries(this, tab_name, tab, record, rid, txn);
+            break;
+        }
+        case WType::UPDATE_TUPLE: {
+            auto current_record = fh->get_record(rid, nullptr);
+            if (current_record != nullptr) {
+                delete_index_entries(this, tab_name, tab, *current_record, txn);
+            }
+            fh->update_record(rid, record.data, nullptr);
+            insert_index_entries(this, tab_name, tab, record, rid, txn);
+            break;
+        }
+    }
 }
 
