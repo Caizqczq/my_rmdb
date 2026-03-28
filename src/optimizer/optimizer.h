@@ -56,7 +56,12 @@ class Optimizer {
             // Set Knob Plan
             return std::make_shared<SetKnobPlan> (x->set_knob_type_, x->bool_val_);
         } else {
-            return planner_->do_planner (query, context);
+            std::shared_ptr<Plan> plan = planner_->do_planner (query, context);
+            if (query->is_explain) {
+                return std::make_shared<ExplainPlan> (std::move (plan), query->cols, query->tables, query->table_aliases,
+                                                      query->select_star);
+            }
+            return plan;
         }
     }
 };

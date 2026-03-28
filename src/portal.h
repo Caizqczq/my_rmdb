@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution/execution_sort.h"
 #include "execution/executor_abstract.h"
 #include "execution/executor_delete.h"
+#include "execution/executor_filter.h"
 #include "execution/executor_index_scan.h"
 #include "execution/executor_insert.h"
 #include "execution/executor_nestedloop_join.h"
@@ -61,6 +62,9 @@ class Portal {
     std::shared_ptr<PortalStmt> start (std::shared_ptr<Plan> plan, Context *context) {
         // 这里可以将select进行拆分，例如：一个select，带有return的select等
         if (auto x = std::dynamic_pointer_cast<OtherPlan> (plan)) {
+            return std::make_shared<PortalStmt> (PORTAL_CMD_UTILITY, std::vector<TabCol> (),
+                                                 std::unique_ptr<AbstractExecutor> (), plan);
+        } else if (auto x = std::dynamic_pointer_cast<ExplainPlan> (plan)) {
             return std::make_shared<PortalStmt> (PORTAL_CMD_UTILITY, std::vector<TabCol> (),
                                                  std::unique_ptr<AbstractExecutor> (), plan);
         } else if (auto x = std::dynamic_pointer_cast<SetKnobPlan> (plan)) {
@@ -154,12 +158,14 @@ class Portal {
     std::unique_ptr<AbstractExecutor> convert_plan_executor (std::shared_ptr<Plan> plan, Context *context) {
         if (auto x = std::dynamic_pointer_cast<ProjectionPlan> (plan)) {
             return std::make_unique<ProjectionExecutor> (convert_plan_executor (x->subplan_, context), x->sel_cols_);
+        } else if (auto x = std::dynamic_pointer_cast<FilterPlan> (plan)) {
+            return std::make_unique<FilterExecutor> (convert_plan_executor (x->subplan_, context), x->conds_);
         } else if (auto x = std::dynamic_pointer_cast<ScanPlan> (plan)) {
             if (x->tag == T_SeqScan) {
-                return std::make_unique<SeqScanExecutor> (sm_manager_, x->tab_name_, x->conds_, context);
+                return std::make_unique<SeqScanExecutor> (sm_manager_, x->tab_name_, x->base_tab_name_, x->conds_, context);
             } else {
-                return std::make_unique<IndexScanExecutor> (sm_manager_, x->tab_name_, x->conds_, x->index_col_names_,
-                                                            x->index_ranges_, context);
+                return std::make_unique<IndexScanExecutor> (sm_manager_, x->tab_name_, x->base_tab_name_, x->conds_,
+                                                            x->index_col_names_, x->index_ranges_, context);
             }
         } else if (auto x = std::dynamic_pointer_cast<JoinPlan> (plan)) {
             std::unique_ptr<AbstractExecutor> left = convert_plan_executor (x->left_, context);

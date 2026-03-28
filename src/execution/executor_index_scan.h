@@ -20,13 +20,12 @@ See the Mulan PSL v2 for more details. */
 
 class IndexScanExecutor : public AbstractExecutor {
     private:
-    std::string tab_name_;              // 表名称
+    std::string tab_name_;              // 逻辑表名/别名
+    std::string base_tab_name_;         // 真实基表名
     TabMeta tab_;                       // 表的元数据
-    std::vector<Condition> conds_;      // 扫描条件
     RmFileHandle *fh_;                  // 表的数据文件句柄
     std::vector<ColMeta> cols_;         // 需要读取的字段
     size_t len_;                        // 选取出来的一条记录的长度
-    std::vector<Condition> fed_conds_;  // 扫描条件，和conds_字段相同
 
     std::vector<std::string> index_col_names_;  // index scan涉及到的索引包含的字段
     IndexMeta index_meta_;                      // index scan涉及到的索引元数据
@@ -39,39 +38,28 @@ class IndexScanExecutor : public AbstractExecutor {
     Iid upper_iid_{-1, -1};
 
     public:
-    IndexScanExecutor (SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds,
+    IndexScanExecutor (SmManager *sm_manager, std::string tab_name, std::string base_tab_name, std::vector<Condition> conds,
                        std::vector<std::string> index_col_names, std::vector<IndexRange> index_ranges,
                        Context *context) {
         sm_manager_ = sm_manager;
         context_ = context;
         tab_name_ = std::move (tab_name);
-        tab_ = sm_manager_->db_.get_table (tab_name_);
-        conds_ = std::move (conds);
+        base_tab_name_ = std::move (base_tab_name);
+        tab_ = sm_manager_->db_.get_table (base_tab_name_);
         // index_no_ = index_no;
         index_col_names_ = index_col_names;
         index_meta_ = *(tab_.get_index_meta (index_col_names_));
         index_ranges_ = std::move (index_ranges);
-        fh_ = sm_manager_->fhs_.at (tab_name_).get ();
+        fh_ = sm_manager_->fhs_.at (base_tab_name_).get ();
         cols_ = tab_.cols;
-        len_ = cols_.back ().offset + cols_.back ().len;
-        std::map<CompOp, CompOp> swap_op = {
-            {OP_EQ, OP_EQ}, {OP_NE, OP_NE}, {OP_LT, OP_GT}, {OP_GT, OP_LT}, {OP_LE, OP_GE}, {OP_GE, OP_LE},
-        };
-
-        for (auto &cond : conds_) {
-            if (cond.lhs_col.tab_name != tab_name_) {
-                // lhs is on other table, now rhs must be on this table
-                assert (!cond.is_rhs_val && cond.rhs_col.tab_name == tab_name_);
-                // swap lhs and rhs
-                std::swap (cond.lhs_col, cond.rhs_col);
-                cond.op = swap_op.at (cond.op);
-            }
+        for (auto &col : cols_) {
+            col.tab_name = tab_name_;
         }
-        fed_conds_ = conds_;
+        len_ = cols_.back ().offset + cols_.back ().len;
     }
 
     void beginTuple () override {
-        auto index_name = sm_manager_->get_ix_manager ()->get_index_name (tab_name_, index_meta_.cols);
+        auto index_name = sm_manager_->get_ix_manager ()->get_index_name (base_tab_name_, index_meta_.cols);
         auto *ih = sm_manager_->ihs_.at (index_name).get ();
 
         if (has_empty_range ()) {
@@ -229,15 +217,11 @@ class IndexScanExecutor : public AbstractExecutor {
         while (scan_ && !scan_->is_end ()) {
             rid_ = scan_->rid ();
             auto rec = fh_->get_record (rid_, context_);
-            if (rec != nullptr && check_conds (rec.get ())) {
+            if (rec != nullptr) {
                 return;
             }
             scan_->next ();
         }
-    }
-
-    bool check_conds (RmRecord *rec) {
-        return evaluate_conditions (cols_, rec, fed_conds_);
     }
 
     static bool iid_less (const Iid &lhs, const Iid &rhs) {

@@ -10,6 +10,13 @@ See the Mulan PSL v2 for more details. */
 
 #include "execution_manager.h"
 
+#include <algorithm>
+#include <fstream>
+#include <iomanip>
+#include <set>
+#include <sstream>
+#include <unordered_map>
+
 #include "executor_delete.h"
 #include "executor_index_scan.h"
 #include "executor_insert.h"
@@ -20,21 +27,221 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "record_printer.h"
 
+namespace {
+
+void append_context_text (Context *context, const std::string &text) {
+    if (context == nullptr || context->data_send_ == nullptr || context->offset_ == nullptr) {
+        return;
+    }
+    memcpy (context->data_send_ + *context->offset_, text.c_str (), text.size ());
+    *context->offset_ += static_cast<int> (text.size ());
+}
+
+void append_output_line (Context *context, std::fstream &outfile, const std::string &line) {
+    append_context_text (context, line);
+    append_context_text (context, "\n");
+    outfile << line << "\n";
+}
+
+std::string visible_table_name (const std::string &tab_name,
+                                const std::unordered_map<std::string, std::string> &table_aliases) {
+    auto it = table_aliases.find (tab_name);
+    return it == table_aliases.end () ? tab_name : it->second;
+}
+
+std::string format_tab_col (const TabCol &col, const std::unordered_map<std::string, std::string> &table_aliases) {
+    return visible_table_name (col.tab_name, table_aliases) + "." + col.col_name;
+}
+
+std::string format_value (const Value &value) {
+    std::ostringstream oss;
+    switch (value.type) {
+        case TYPE_INT:
+            oss << value.int_val;
+            break;
+        case TYPE_FLOAT:
+            oss << std::fixed << std::setprecision (6) << value.float_val;
+            break;
+        case TYPE_STRING:
+            oss << "'" << value.str_val << "'";
+            break;
+        default:
+            break;
+    }
+    return oss.str ();
+}
+
+std::string format_comp_op (CompOp op) {
+    switch (op) {
+        case OP_EQ:
+            return "=";
+        case OP_NE:
+            return "<>";
+        case OP_LT:
+            return "<";
+        case OP_GT:
+            return ">";
+        case OP_LE:
+            return "<=";
+        case OP_GE:
+            return ">=";
+        default:
+            return "?";
+    }
+}
+
+std::string format_condition (const Condition &cond,
+                              const std::unordered_map<std::string, std::string> &table_aliases) {
+    std::ostringstream oss;
+    oss << format_tab_col (cond.lhs_col, table_aliases) << format_comp_op (cond.op);
+    if (cond.is_rhs_val) {
+        oss << format_value (cond.rhs_val);
+    } else {
+        oss << format_tab_col (cond.rhs_col, table_aliases);
+    }
+    return oss.str ();
+}
+
+template <typename T>
+std::string join_strings (const std::vector<T> &items) {
+    std::ostringstream oss;
+    for (size_t i = 0; i < items.size (); ++i) {
+        if (i != 0) {
+            oss << ",";
+        }
+        oss << items[i];
+    }
+    return oss.str ();
+}
+
+std::vector<std::string> collect_plan_tables (const std::shared_ptr<Plan> &plan) {
+    if (auto scan = std::dynamic_pointer_cast<ScanPlan> (plan)) {
+        return {scan->base_tab_name_};
+    }
+    if (auto join = std::dynamic_pointer_cast<JoinPlan> (plan)) {
+        auto left_tables = collect_plan_tables (join->left_);
+        auto right_tables = collect_plan_tables (join->right_);
+        left_tables.insert (left_tables.end (), right_tables.begin (), right_tables.end ());
+        std::sort (left_tables.begin (), left_tables.end ());
+        return left_tables;
+    }
+    if (auto projection = std::dynamic_pointer_cast<ProjectionPlan> (plan)) {
+        return collect_plan_tables (projection->subplan_);
+    }
+    if (auto filter = std::dynamic_pointer_cast<FilterPlan> (plan)) {
+        return collect_plan_tables (filter->subplan_);
+    }
+    if (auto sort = std::dynamic_pointer_cast<SortPlan> (plan)) {
+        return collect_plan_tables (sort->subplan_);
+    }
+    if (auto dml = std::dynamic_pointer_cast<DMLPlan> (plan)) {
+        return collect_plan_tables (dml->subplan_);
+    }
+    if (auto explain = std::dynamic_pointer_cast<ExplainPlan> (plan)) {
+        return collect_plan_tables (explain->subplan_);
+    }
+    return {};
+}
+
+bool plan_contains_table (const std::shared_ptr<Plan> &plan, const std::string &tab_name) {
+    auto tables = collect_plan_tables (plan);
+    return std::find (tables.begin (), tables.end (), tab_name) != tables.end ();
+}
+
+std::vector<std::string> format_conditions (const std::vector<Condition> &conds,
+                                            const std::unordered_map<std::string, std::string> &table_aliases) {
+    std::vector<std::string> result;
+    result.reserve (conds.size ());
+    for (const auto &cond : conds) {
+        result.push_back (format_condition (cond, table_aliases));
+    }
+    return result;
+}
+
+
+void render_explain_plan (const std::shared_ptr<Plan> &plan, const ExplainPlan &explain_plan,
+                          std::vector<std::string> &lines) {
+    if (auto projection = std::dynamic_pointer_cast<ProjectionPlan> (plan)) {
+        std::vector<std::string> cols;
+        cols.reserve (projection->sel_cols_.size ());
+        for (const auto &col : projection->sel_cols_) {
+            cols.push_back (format_tab_col (col, explain_plan.table_aliases_));
+        }
+        std::sort (cols.begin (), cols.end ());
+        lines.push_back ("Project(columns=[" + join_strings (cols) + "])");
+        render_explain_plan (projection->subplan_, explain_plan, lines);
+        return;
+    }
+    if (auto filter = std::dynamic_pointer_cast<FilterPlan> (plan)) {
+        auto conds = format_conditions (filter->conds_, explain_plan.table_aliases_);
+        lines.push_back ("Filter(condition=[" + join_strings (conds) + "])");
+        render_explain_plan (filter->subplan_, explain_plan, lines);
+        return;
+    }
+    if (auto sort = std::dynamic_pointer_cast<SortPlan> (plan)) {
+        lines.push_back ("Sort(column=[" + format_tab_col (sort->sel_col_, explain_plan.table_aliases_) +
+                         "],desc=" + std::string (sort->is_desc_ ? "true" : "false") + ")");
+        render_explain_plan (sort->subplan_, explain_plan, lines);
+        return;
+    }
+    if (auto join = std::dynamic_pointer_cast<JoinPlan> (plan)) {
+        auto tables = collect_plan_tables (plan);
+        auto conds = format_conditions (join->conds_, explain_plan.table_aliases_);
+        lines.push_back ("Join(tables=[" + join_strings (tables) + "],condition=[" + join_strings (conds) + "])");
+        render_explain_plan (join->left_, explain_plan, lines);
+        render_explain_plan (join->right_, explain_plan, lines);
+        return;
+    }
+    if (auto scan = std::dynamic_pointer_cast<ScanPlan> (plan)) {
+        lines.push_back ("Scan(table=" + scan->base_tab_name_ + ")");
+    }
+}
+
+void explain_plan_to_lines (const ExplainPlan &explain_plan, std::vector<std::string> &lines) {
+    auto dml = std::dynamic_pointer_cast<DMLPlan> (explain_plan.subplan_);
+    if (dml == nullptr || dml->tag != T_select) {
+        lines.push_back ("EXPLAIN only supports SELECT statements");
+        return;
+    }
+    if (auto projection = std::dynamic_pointer_cast<ProjectionPlan> (dml->subplan_)) {
+        if (explain_plan.select_star_) {
+            lines.push_back ("Project(columns=[*])");
+            render_explain_plan (projection->subplan_, explain_plan, lines);
+            return;
+        }
+    }
+    render_explain_plan (dml->subplan_, explain_plan, lines);
+}
+
+}  // namespace
+
 const char *help_info =
     "Supported SQL syntax:\n"
     "  command ;\n"
     "command:\n"
+    "  HELP\n"
+    "  EXIT\n"
+    "  SHOW TABLES\n"
+    "  SHOW INDEX FROM table_name\n"
+    "  DESC table_name\n"
     "  CREATE TABLE table_name (column_name type [, column_name type ...])\n"
     "  DROP TABLE table_name\n"
-    "  SHOW INDEX FROM table_name\n"
     "  CREATE INDEX table_name (column_name)\n"
     "  DROP INDEX table_name (column_name)\n"
     "  INSERT INTO table_name VALUES (value [, value ...])\n"
     "  DELETE FROM table_name [WHERE where_clause]\n"
     "  UPDATE table_name SET column_name = value [, column_name = value ...] [WHERE where_clause]\n"
-    "  SELECT selector FROM table_name [WHERE where_clause]\n"
+    "  SELECT selector FROM from_item [WHERE where_clause] [ORDER BY column [ASC|DESC]]\n"
+    "  EXPLAIN SELECT selector FROM from_item [WHERE where_clause] [ORDER BY column [ASC|DESC]]\n"
+    "  SET {ENABLE_NESTLOOP | ENABLE_SORTMERGE} = {true | false}\n"
+    "  TXN_BEGIN | TXN_COMMIT | TXN_ABORT | TXN_ROLLBACK\n"
     "type:\n"
     "  {INT | FLOAT | CHAR(n)}\n"
+    "from_item:\n"
+    "  table_name [alias]\n"
+    "  table_name [AS alias]\n"
+    "  from_item , table_name [alias]\n"
+    "  from_item JOIN table_name [alias] ON where_clause\n"
     "where_clause:\n"
     "  condition [AND condition ...]\n"
     "condition:\n"
@@ -119,6 +326,15 @@ void QlManager::run_cmd_utility (std::shared_ptr<Plan> plan, txn_id_t *txn_id, C
                 break;
         }
 
+    } else if (auto x = std::dynamic_pointer_cast<ExplainPlan> (plan)) {
+        std::vector<std::string> lines;
+        explain_plan_to_lines (*x, lines);
+        std::fstream outfile;
+        outfile.open ("output.txt", std::ios::out | std::ios::app);
+        for (const auto &line : lines) {
+            append_output_line (context, outfile, line);
+        }
+        outfile.close ();
     } else if (auto x = std::dynamic_pointer_cast<SetKnobPlan> (plan)) {
         switch (x->set_knob_type_) {
             case ast::SetKnobType::EnableNestLoop: {

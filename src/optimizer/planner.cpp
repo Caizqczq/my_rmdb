@@ -206,11 +206,7 @@ std::vector<Condition> extract_join_conditions (std::vector<Condition> &conds, c
         bool lhs_in_right = contains_table (right_tables, it->lhs_col.tab_name);
         bool rhs_in_right = contains_table (right_tables, it->rhs_col.tab_name);
         if ((lhs_in_left && rhs_in_right) || (lhs_in_right && rhs_in_left)) {
-            Condition cond = *it;
-            if (lhs_in_right) {
-                swap_condition_operands (cond);
-            }
-            join_conds.push_back (std::move (cond));
+            join_conds.push_back (*it);
             it = conds.erase (it);
         } else {
             ++it;
@@ -238,6 +234,15 @@ int attach_join_condition (Condition cond, const std::shared_ptr<Plan> &plan) {
         join->conds_.push_back (std::move (cond));
         return 3;
     }
+    if (auto projection = std::dynamic_pointer_cast<ProjectionPlan> (plan)) {
+        return attach_join_condition (std::move (cond), projection->subplan_);
+    }
+    if (auto filter = std::dynamic_pointer_cast<FilterPlan> (plan)) {
+        return attach_join_condition (std::move (cond), filter->subplan_);
+    }
+    if (auto sort = std::dynamic_pointer_cast<SortPlan> (plan)) {
+        return attach_join_condition (std::move (cond), sort->subplan_);
+    }
     if (auto scan = std::dynamic_pointer_cast<ScanPlan> (plan)) {
         if (scan->tab_name_ == cond.lhs_col.tab_name) {
             return 1;
@@ -249,11 +254,17 @@ int attach_join_condition (Condition cond, const std::shared_ptr<Plan> &plan) {
     return 0;
 }
 
-TabCol resolve_column_from_tables (SmManager *sm_manager, const std::vector<std::string> &tables, TabCol target) {
+TabCol resolve_column_from_tables (SmManager *sm_manager, const std::vector<std::string> &tables,
+                                   const std::unordered_map<std::string, std::string> &table_sources, TabCol target) {
     std::vector<ColMeta> all_cols;
     for (const auto &tab_name : tables) {
-        const auto &cols = sm_manager->db_.get_table (tab_name).cols;
-        all_cols.insert (all_cols.end (), cols.begin (), cols.end ());
+        const auto source_it = table_sources.find (tab_name);
+        const std::string &base_tab_name = source_it == table_sources.end () ? tab_name : source_it->second;
+        const auto &cols = sm_manager->db_.get_table (base_tab_name).cols;
+        for (auto col : cols) {
+            col.tab_name = tab_name;
+            all_cols.push_back (std::move (col));
+        }
     }
 
     if (target.tab_name.empty ()) {
@@ -282,14 +293,65 @@ TabCol resolve_column_from_tables (SmManager *sm_manager, const std::vector<std:
     throw ColumnNotFoundError (target.tab_name + '.' + target.col_name);
 }
 
+void collect_jointree_join_conditions (const std::shared_ptr<Query::JoinTreeNode> &jointree,
+                                       std::vector<Condition> &join_conds) {
+    if (jointree == nullptr || jointree->is_leaf ()) {
+        return;
+    }
+    join_conds.insert (join_conds.end (), jointree->join_conds.begin (), jointree->join_conds.end ());
+    collect_jointree_join_conditions (jointree->left, join_conds);
+    collect_jointree_join_conditions (jointree->right, join_conds);
+}
+
+std::vector<TabCol> sort_projection_cols (std::set<TabCol> cols) {
+    std::vector<TabCol> ordered_cols (cols.begin (), cols.end ());
+    std::sort (ordered_cols.begin (), ordered_cols.end (),
+               [] (const TabCol &lhs, const TabCol &rhs) { return std::tie (lhs.tab_name, lhs.col_name) < std::tie (rhs.tab_name, rhs.col_name); });
+    return ordered_cols;
+}
+
+std::unordered_map<std::string, std::vector<TabCol>> collect_leaf_projection_cols (
+    const std::shared_ptr<Query> &query, const std::vector<Condition> &join_conds) {
+    std::unordered_map<std::string, std::set<TabCol>> required_cols;
+    for (const auto &col : query->cols) {
+        required_cols[col.tab_name].insert (col);
+    }
+    for (const auto &cond : join_conds) {
+        required_cols[cond.lhs_col.tab_name].insert (cond.lhs_col);
+        if (!cond.is_rhs_val) {
+            required_cols[cond.rhs_col.tab_name].insert (cond.rhs_col);
+        }
+    }
+    if (auto select = std::dynamic_pointer_cast<ast::SelectStmt> (query->parse)) {
+        if (select->order != nullptr) {
+            required_cols[select->order->cols->tab_name].insert (
+                TabCol{select->order->cols->tab_name, select->order->cols->col_name});
+        }
+    }
+
+    std::unordered_map<std::string, std::vector<TabCol>> result;
+    for (auto &[tab_name, cols] : required_cols) {
+        result.emplace (tab_name, sort_projection_cols (std::move (cols)));
+    }
+    return result;
+}
+
+struct JoinForestNode {
+    std::vector<std::string> tables;
+    std::shared_ptr<Plan> plan;
+    size_t width = 0;
+    bool is_leaf = true;
+};
+
 }  // namespace
 
-bool Planner::get_index_scan_info (std::string tab_name, const std::vector<Condition> &curr_conds,
+bool Planner::get_index_scan_info (std::string tab_name, const std::string &base_tab_name,
+                                   const std::vector<Condition> &curr_conds,
                                    std::vector<std::string> &index_col_names, std::vector<IndexRange> &index_ranges) {
     index_col_names.clear ();
     index_ranges.clear ();
 
-    TabMeta &tab = sm_manager_->db_.get_table (tab_name);
+    TabMeta &tab = sm_manager_->db_.get_table (base_tab_name);
     if (curr_conds.empty () && !tab.indexes.empty ()) {
         for (const auto &col : tab.indexes.front ().cols) {
             index_col_names.push_back (col.name);
@@ -425,16 +487,32 @@ std::shared_ptr<Plan> Planner::physical_optimization (std::shared_ptr<Query> que
     return plan;
 }
 
-std::shared_ptr<Plan> Planner::generate_table_access_plan (const std::string &tab_name, std::vector<Condition> conds) {
+std::shared_ptr<Plan> Planner::generate_table_access_plan (const std::string &tab_name, const std::string &base_tab_name,
+                                                           std::vector<Condition> conds) {
     std::vector<std::string> index_col_names;
     std::vector<IndexRange> index_ranges;
-    bool index_exist = get_index_scan_info (tab_name, conds, index_col_names, index_ranges);
+    bool index_exist = get_index_scan_info (tab_name, base_tab_name, conds, index_col_names, index_ranges);
     if (!index_exist) {
-        return std::make_shared<ScanPlan> (T_SeqScan, sm_manager_, tab_name, std::move (conds),
+        return std::make_shared<ScanPlan> (T_SeqScan, sm_manager_, tab_name, base_tab_name, std::move (conds),
                                            std::vector<std::string> (), std::vector<IndexRange> ());
     }
-    return std::make_shared<ScanPlan> (T_IndexScan, sm_manager_, tab_name, std::move (conds), std::move (index_col_names),
-                                       std::move (index_ranges));
+    return std::make_shared<ScanPlan> (T_IndexScan, sm_manager_, tab_name, base_tab_name, std::move (conds),
+                                       std::move (index_col_names), std::move (index_ranges));
+}
+
+std::shared_ptr<Plan> Planner::build_table_plan (const std::string &tab_name, const std::string &base_tab_name,
+                                                 std::vector<Condition> local_conds,
+                                                 const std::vector<TabCol> &leaf_projection_cols,
+                                                 bool need_leaf_projection) {
+    auto filter_conds = local_conds;
+    std::shared_ptr<Plan> plan = generate_table_access_plan (tab_name, base_tab_name, std::move (local_conds));
+    if (!filter_conds.empty ()) {
+        plan = std::make_shared<FilterPlan> (T_Filter, std::move (plan), std::move (filter_conds));
+    }
+    if (need_leaf_projection && !leaf_projection_cols.empty ()) {
+        plan = std::make_shared<ProjectionPlan> (T_Projection, std::move (plan), leaf_projection_cols);
+    }
+    return plan;
 }
 
 PlanTag Planner::choose_join_plan_tag (const std::vector<Condition> &join_conds) const {
@@ -456,43 +534,102 @@ PlanTag Planner::choose_join_plan_tag (const std::vector<Condition> &join_conds)
 
 std::shared_ptr<Plan> Planner::make_one_rel (std::shared_ptr<Query> query) {
     std::vector<Condition> remaining_conds = query->conds;
-    if (query->jointree != nullptr) {
-        std::shared_ptr<Plan> plan = make_one_rel (query->jointree, remaining_conds);
-        for (const auto &cond : remaining_conds) {
-            if (is_join_condition (cond)) {
-                attach_join_condition (cond, plan);
+    std::vector<Condition> join_conds;
+    collect_jointree_join_conditions (query->jointree, join_conds);
+
+    std::vector<JoinForestNode> forest;
+    forest.reserve (query->tables.size ());
+    for (const auto &cond : remaining_conds) {
+        if (is_join_condition (cond)) {
+            join_conds.push_back (cond);
+        }
+    }
+    auto leaf_projection_cols = collect_leaf_projection_cols (query, join_conds);
+    bool need_leaf_projection = query->tables.size () > 1 && !query->select_star;
+
+    for (const auto &tab_name : query->tables) {
+        const auto source_it = query->table_sources.find (tab_name);
+        const std::string &base_tab_name = source_it == query->table_sources.end () ? tab_name : source_it->second;
+        auto local_conds = extract_table_conditions (remaining_conds, tab_name);
+        auto projection_it = leaf_projection_cols.find (tab_name);
+        const std::vector<TabCol> empty_cols;
+        const auto &table_projection_cols = projection_it == leaf_projection_cols.end () ? empty_cols : projection_it->second;
+        auto plan = build_table_plan (tab_name, base_tab_name, local_conds, table_projection_cols, need_leaf_projection);
+
+        TabMeta &tab = sm_manager_->db_.get_table (base_tab_name);
+        size_t width = need_leaf_projection && !table_projection_cols.empty () ? table_projection_cols.size () : tab.cols.size ();
+        forest.push_back (JoinForestNode{{tab_name}, std::move (plan), width, true});
+    }
+
+    auto better_pair = [&forest] (size_t lhs_i, size_t lhs_j, size_t rhs_i, size_t rhs_j) {
+        size_t lhs_width = forest[lhs_i].width + forest[lhs_j].width;
+        size_t rhs_width = forest[rhs_i].width + forest[rhs_j].width;
+        if (lhs_width != rhs_width) {
+            return lhs_width < rhs_width;
+        }
+        auto lhs_key = forest[lhs_i].tables.front () + "|" + forest[lhs_j].tables.front ();
+        auto rhs_key = forest[rhs_i].tables.front () + "|" + forest[rhs_j].tables.front ();
+        return lhs_key < rhs_key;
+    };
+
+    while (forest.size () > 1) {
+        bool found = false;
+        bool found_connectable = false;
+        size_t best_i = 0;
+        size_t best_j = 1;
+        for (size_t i = 0; i < forest.size (); ++i) {
+            for (size_t j = i + 1; j < forest.size (); ++j) {
+                bool connectable = false;
+                for (const auto &cond : join_conds) {
+                    bool lhs_in_i = contains_table (forest[i].tables, cond.lhs_col.tab_name);
+                    bool rhs_in_i = contains_table (forest[i].tables, cond.rhs_col.tab_name);
+                    bool lhs_in_j = contains_table (forest[j].tables, cond.lhs_col.tab_name);
+                    bool rhs_in_j = contains_table (forest[j].tables, cond.rhs_col.tab_name);
+                    if ((lhs_in_i && rhs_in_j) || (lhs_in_j && rhs_in_i)) {
+                        connectable = true;
+                        break;
+                    }
+                }
+                if (!found || (connectable && !found_connectable) ||
+                    (connectable == found_connectable && better_pair (i, j, best_i, best_j))) {
+                    best_i = i;
+                    best_j = j;
+                    found = true;
+                    found_connectable = connectable;
+                }
             }
         }
-        return plan;
+
+        auto left = std::move (forest[best_i]);
+        auto right = std::move (forest[best_j]);
+        if ((left.is_leaf && !right.is_leaf) ||
+            (left.is_leaf == right.is_leaf &&
+             (left.width > right.width || (left.width == right.width && left.tables > right.tables)))) {
+            std::swap (left, right);
+        }
+        auto pair_join_conds = extract_join_conditions (join_conds, left.tables, right.tables);
+        auto plan = std::make_shared<JoinPlan> (choose_join_plan_tag (pair_join_conds), left.plan, right.plan,
+                                                std::move (pair_join_conds));
+
+        JoinForestNode merged;
+        merged.plan = std::move (plan);
+        merged.tables = left.tables;
+        merged.tables.insert (merged.tables.end (), right.tables.begin (), right.tables.end ());
+        std::sort (merged.tables.begin (), merged.tables.end ());
+        merged.width = left.width + right.width;
+        merged.is_leaf = false;
+
+        forest.erase (forest.begin () + best_j);
+        forest.erase (forest.begin () + best_i);
+        forest.push_back (std::move (merged));
     }
 
-    if (query->tables.size () == 1) {
-        auto local_conds = extract_table_conditions (remaining_conds, query->tables[0]);
-        return generate_table_access_plan (query->tables[0], std::move (local_conds));
+    std::shared_ptr<Plan> plan = forest.front ().plan;
+    for (const auto &cond : join_conds) {
+        if (is_join_condition (cond)) {
+            attach_join_condition (cond, plan);
+        }
     }
-
-    throw InternalError ("Select query has no join tree");
-}
-
-std::shared_ptr<Plan> Planner::make_one_rel (const std::shared_ptr<Query::JoinTreeNode> &jointree,
-                                             std::vector<Condition> &remaining_conds) {
-    if (jointree == nullptr) {
-        return nullptr;
-    }
-
-    if (jointree->is_leaf ()) {
-        auto local_conds = extract_table_conditions (remaining_conds, jointree->table_name);
-        return generate_table_access_plan (jointree->table_name, std::move (local_conds));
-    }
-
-    std::shared_ptr<Plan> left = make_one_rel (jointree->left, remaining_conds);
-    std::shared_ptr<Plan> right = make_one_rel (jointree->right, remaining_conds);
-    std::vector<Condition> join_conds = jointree->join_conds;
-    auto where_join_conds = extract_join_conditions (remaining_conds, jointree->left->tables, jointree->right->tables);
-    join_conds.insert (join_conds.end (), where_join_conds.begin (), where_join_conds.end ());
-    auto plan = std::make_shared<JoinPlan> (choose_join_plan_tag (join_conds), std::move (left), std::move (right),
-                                            std::move (join_conds));
-    plan->type = jointree->join_type;
     return plan;
 }
 
@@ -502,7 +639,7 @@ std::shared_ptr<Plan> Planner::generate_sort_plan (std::shared_ptr<Query> query,
         return plan;
     }
     TabCol order_col = {.tab_name = x->order->cols->tab_name, .col_name = x->order->cols->col_name};
-    order_col = resolve_column_from_tables (sm_manager_, query->tables, order_col);
+    order_col = resolve_column_from_tables (sm_manager_, query->tables, query->table_sources, order_col);
     return std::make_shared<SortPlan> (T_Sort, std::move (plan), std::move (order_col),
                                        x->order->orderby_dir == ast::OrderBy_DESC);
 }
@@ -562,14 +699,16 @@ std::shared_ptr<Plan> Planner::do_planner (std::shared_ptr<Query> query, Context
     } else if (auto x = std::dynamic_pointer_cast<ast::DeleteStmt> (query->parse)) {
         // delete;
         // 生成表扫描方式
-        std::shared_ptr<Plan> table_scan_executors = generate_table_access_plan (x->tab_name, query->conds);
+        std::shared_ptr<Plan> table_scan_executors =
+            build_table_plan (x->tab_name, x->tab_name, query->conds, std::vector<TabCol> (), false);
 
         plannerRoot = std::make_shared<DMLPlan> (T_Delete, table_scan_executors, x->tab_name, std::vector<Value> (),
                                                  query->conds, std::vector<SetClause> ());
     } else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt> (query->parse)) {
         // update;
         // 生成表扫描方式
-        std::shared_ptr<Plan> table_scan_executors = generate_table_access_plan (x->tab_name, query->conds);
+        std::shared_ptr<Plan> table_scan_executors =
+            build_table_plan (x->tab_name, x->tab_name, query->conds, std::vector<TabCol> (), false);
         plannerRoot = std::make_shared<DMLPlan> (T_Update, table_scan_executors, x->tab_name, std::vector<Value> (),
                                                  query->conds, query->set_clauses);
     } else if (auto x = std::dynamic_pointer_cast<ast::SelectStmt> (query->parse)) {

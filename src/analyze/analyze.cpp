@@ -18,11 +18,24 @@ See the Mulan PSL v2 for more details. */
  * @return {shared_ptr<Query>} Query
  */
 std::shared_ptr<Query> Analyze::do_analyze (std::shared_ptr<ast::TreeNode> parse) {
+    if (auto x = std::dynamic_pointer_cast<ast::ExplainStmt> (parse)) {
+        auto query = do_analyze (x->statement);
+        if (!std::dynamic_pointer_cast<ast::SelectStmt> (query->parse)) {
+            throw RMDBError ("EXPLAIN only supports SELECT statements");
+        }
+        query->is_explain = true;
+        return query;
+    }
+
     std::shared_ptr<Query> query = std::make_shared<Query> ();
     if (auto x = std::dynamic_pointer_cast<ast::SelectStmt> (parse)) {
-        std::unordered_map<std::string, std::string> alias_to_table;
-        collect_table_refs (x->from, query->tables, alias_to_table);
-        query->jointree = build_join_tree (x->from, alias_to_table);
+        std::unordered_map<std::string, std::string> visible_to_table;
+        collect_table_refs (x->from, query->tables, visible_to_table, query->table_sources);
+        for (const auto &visible_name : query->tables) {
+            query->table_aliases[visible_name] = visible_name;
+        }
+        query->jointree = build_join_tree (x->from, visible_to_table);
+        query->select_star = x->cols.empty ();
 
         // 处理target list，再target list中添加上表名，例如 a.id
         for (auto &sv_sel_col : x->cols) {
@@ -31,7 +44,7 @@ std::shared_ptr<Query> Analyze::do_analyze (std::shared_ptr<ast::TreeNode> parse
         }
 
         std::vector<ColMeta> all_cols;
-        get_all_cols (query->tables, all_cols);
+        get_all_cols (query->tables, query->table_sources, all_cols);
         if (query->cols.empty ()) {
             // select all columns
             for (auto &col : all_cols) {
@@ -41,20 +54,21 @@ std::shared_ptr<Query> Analyze::do_analyze (std::shared_ptr<ast::TreeNode> parse
         } else {
             // infer table name from column name
             for (auto &sel_col : query->cols) {
-                sel_col = check_column (all_cols, sel_col, alias_to_table);  // 列元数据校验
+                sel_col = check_column (all_cols, sel_col, visible_to_table);  // 列元数据校验
             }
         }
         // 处理where条件
         get_clause (x->conds, query->conds);
-        check_clause (query->tables, query->conds, alias_to_table);
+        check_clause (query->tables, query->conds, visible_to_table, query->table_sources);
         if (x->order != nullptr) {
             TabCol order_col = {.tab_name = x->order->cols->tab_name, .col_name = x->order->cols->col_name};
-            order_col = check_column (all_cols, order_col, alias_to_table);
+            order_col = check_column (all_cols, order_col, visible_to_table);
             x->order->cols->tab_name = order_col.tab_name;
             x->order->cols->col_name = order_col.col_name;
         }
     } else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt> (parse)) {
         query->tables = {x->tab_name};
+        query->table_sources[x->tab_name] = x->tab_name;
         TabMeta &tab = sm_manager_->db_.get_table (x->tab_name);
         query->set_clauses.reserve (x->set_clauses.size ());
         for (auto &sv_set_clause : x->set_clauses) {
@@ -78,6 +92,8 @@ std::shared_ptr<Query> Analyze::do_analyze (std::shared_ptr<ast::TreeNode> parse
     } else if (auto x = std::dynamic_pointer_cast<ast::DeleteStmt> (parse)) {
         // 处理where条件
         get_clause (x->conds, query->conds);
+        query->tables = {x->tab_name};
+        query->table_sources[x->tab_name] = x->tab_name;
         check_clause ({x->tab_name}, query->conds);
     } else if (auto x = std::dynamic_pointer_cast<ast::InsertStmt> (parse)) {
         // 处理insert 的values值
@@ -92,27 +108,25 @@ std::shared_ptr<Query> Analyze::do_analyze (std::shared_ptr<ast::TreeNode> parse
 }
 
 void Analyze::collect_table_refs (const std::shared_ptr<ast::TableRef> &table_ref, std::vector<std::string> &tab_names,
-                                  std::unordered_map<std::string, std::string> &alias_to_table) const {
+                                  std::unordered_map<std::string, std::string> &visible_to_table,
+                                  std::unordered_map<std::string, std::string> &table_sources) const {
     if (auto table = std::dynamic_pointer_cast<ast::TableFactor> (table_ref)) {
         if (!sm_manager_->db_.is_table (table->tab_name)) {
             throw TableNotFoundError (table->tab_name);
         }
-        if (std::find (tab_names.begin (), tab_names.end (), table->tab_name) != tab_names.end ()) {
-            throw RMDBError ("Self join is not supported yet: " + table->tab_name);
-        }
-
-        tab_names.push_back (table->tab_name);
         std::string visible_name = table->alias.empty () ? table->tab_name : table->alias;
-        if (alias_to_table.count (visible_name) != 0) {
+        if (visible_to_table.count (visible_name) != 0) {
             throw RMDBError ("Duplicate table alias: " + visible_name);
         }
-        alias_to_table.emplace (visible_name, table->tab_name);
+        tab_names.push_back (visible_name);
+        visible_to_table.emplace (visible_name, table->tab_name);
+        table_sources.emplace (visible_name, table->tab_name);
         return;
     }
 
     if (auto join = std::dynamic_pointer_cast<ast::JoinExpr> (table_ref)) {
-        collect_table_refs (join->left, tab_names, alias_to_table);
-        collect_table_refs (join->right, tab_names, alias_to_table);
+        collect_table_refs (join->left, tab_names, visible_to_table, table_sources);
+        collect_table_refs (join->right, tab_names, visible_to_table, table_sources);
         return;
     }
 
@@ -121,27 +135,27 @@ void Analyze::collect_table_refs (const std::shared_ptr<ast::TableRef> &table_re
 
 std::shared_ptr<Query::JoinTreeNode> Analyze::build_join_tree (
     const std::shared_ptr<ast::TableRef> &table_ref,
-    const std::unordered_map<std::string, std::string> &alias_to_table) const {
+    const std::unordered_map<std::string, std::string> &visible_to_table) const {
     if (table_ref == nullptr) {
         return nullptr;
     }
 
     if (auto table = std::dynamic_pointer_cast<ast::TableFactor> (table_ref)) {
         auto node = std::make_shared<Query::JoinTreeNode> ();
-        node->table_name = table->tab_name;
-        node->tables.push_back (table->tab_name);
+        node->table_name = table->alias.empty () ? table->tab_name : table->alias;
+        node->tables.push_back (node->table_name);
         return node;
     }
 
     if (auto join = std::dynamic_pointer_cast<ast::JoinExpr> (table_ref)) {
         auto node = std::make_shared<Query::JoinTreeNode> ();
         node->join_type = join->type;
-        node->left = build_join_tree (join->left, alias_to_table);
-        node->right = build_join_tree (join->right, alias_to_table);
+        node->left = build_join_tree (join->left, visible_to_table);
+        node->right = build_join_tree (join->right, visible_to_table);
         node->tables = node->left->tables;
         node->tables.insert (node->tables.end (), node->right->tables.begin (), node->right->tables.end ());
         get_clause (join->conds, node->join_conds);
-        check_clause (node->tables, node->join_conds, alias_to_table);
+        check_clause (node->tables, node->join_conds, visible_to_table, visible_to_table);
         return node;
     }
 
@@ -149,7 +163,7 @@ std::shared_ptr<Query::JoinTreeNode> Analyze::build_join_tree (
 }
 
 TabCol Analyze::check_column (const std::vector<ColMeta> &all_cols, TabCol target,
-                              const std::unordered_map<std::string, std::string> &alias_to_table) const {
+                              const std::unordered_map<std::string, std::string> &visible_to_table) const {
     if (target.tab_name.empty ()) {
         // Table name not specified, infer table name from column name
         std::string tab_name;
@@ -166,9 +180,9 @@ TabCol Analyze::check_column (const std::vector<ColMeta> &all_cols, TabCol targe
         }
         target.tab_name = tab_name;
     } else {
-        auto alias_it = alias_to_table.find (target.tab_name);
-        if (alias_it != alias_to_table.end ()) {
-            target.tab_name = alias_it->second;
+        auto alias_it = visible_to_table.find (target.tab_name);
+        if (alias_it != visible_to_table.end ()) {
+            target.tab_name = alias_it->first;
         }
         bool found = false;
         for (auto &col : all_cols) {
@@ -184,11 +198,17 @@ TabCol Analyze::check_column (const std::vector<ColMeta> &all_cols, TabCol targe
     return target;
 }
 
-void Analyze::get_all_cols (const std::vector<std::string> &tab_names, std::vector<ColMeta> &all_cols) const {
+void Analyze::get_all_cols (const std::vector<std::string> &tab_names,
+                            const std::unordered_map<std::string, std::string> &table_sources,
+                            std::vector<ColMeta> &all_cols) const {
     for (auto &sel_tab_name : tab_names) {
-        // 这里db_不能写成get_db(), 注意要传指针
-        const auto &sel_tab_cols = sm_manager_->db_.get_table (sel_tab_name).cols;
-        all_cols.insert (all_cols.end (), sel_tab_cols.begin (), sel_tab_cols.end ());
+        const auto table_it = table_sources.find (sel_tab_name);
+        const std::string &base_tab_name = table_it == table_sources.end () ? sel_tab_name : table_it->second;
+        const auto &sel_tab_cols = sm_manager_->db_.get_table (base_tab_name).cols;
+        for (auto col : sel_tab_cols) {
+            col.tab_name = sel_tab_name;
+            all_cols.push_back (std::move (col));
+        }
     }
 }
 
@@ -211,18 +231,21 @@ void Analyze::get_clause (const std::vector<std::shared_ptr<ast::BinaryExpr>> &s
 }
 
 void Analyze::check_clause (const std::vector<std::string> &tab_names, std::vector<Condition> &conds,
-                            const std::unordered_map<std::string, std::string> &alias_to_table) const {
+                            const std::unordered_map<std::string, std::string> &visible_to_table,
+                            const std::unordered_map<std::string, std::string> &table_sources) const {
     // auto all_cols = get_all_cols(tab_names);
     std::vector<ColMeta> all_cols;
-    get_all_cols (tab_names, all_cols);
+    get_all_cols (tab_names, table_sources, all_cols);
     // Get raw values in where clause
     for (auto &cond : conds) {
         // Infer table name from column name
-        cond.lhs_col = check_column (all_cols, cond.lhs_col, alias_to_table);
+        cond.lhs_col = check_column (all_cols, cond.lhs_col, visible_to_table);
         if (!cond.is_rhs_val) {
-            cond.rhs_col = check_column (all_cols, cond.rhs_col, alias_to_table);
+            cond.rhs_col = check_column (all_cols, cond.rhs_col, visible_to_table);
         }
-        TabMeta &lhs_tab = sm_manager_->db_.get_table (cond.lhs_col.tab_name);
+        const auto lhs_it = table_sources.find (cond.lhs_col.tab_name);
+        const std::string &lhs_base_tab = lhs_it == table_sources.end () ? cond.lhs_col.tab_name : lhs_it->second;
+        TabMeta &lhs_tab = sm_manager_->db_.get_table (lhs_base_tab);
         auto lhs_col = lhs_tab.get_col (cond.lhs_col.col_name);
         ColType lhs_type = lhs_col->type;
         ColType rhs_type;
@@ -238,7 +261,9 @@ void Analyze::check_clause (const std::vector<std::string> &tab_names, std::vect
             }
             cond.rhs_val.init_raw (lhs_col->len);
         } else {
-            TabMeta &rhs_tab = sm_manager_->db_.get_table (cond.rhs_col.tab_name);
+            const auto rhs_it = table_sources.find (cond.rhs_col.tab_name);
+            const std::string &rhs_base_tab = rhs_it == table_sources.end () ? cond.rhs_col.tab_name : rhs_it->second;
+            TabMeta &rhs_tab = sm_manager_->db_.get_table (rhs_base_tab);
             auto rhs_col = rhs_tab.get_col (cond.rhs_col.col_name);
             rhs_type = rhs_col->type;
         }

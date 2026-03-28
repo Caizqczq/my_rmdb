@@ -21,7 +21,7 @@ using namespace ast;
 %define parse.error verbose
 
 // keywords
-%token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY
+%token SHOW TABLES CREATE TABLE DROP DESC EXPLAIN INSERT INTO VALUES DELETE FROM ASC ORDER BY
 WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN ON AS EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE
 // non-keywords
 %token LEQ NEQ GEQ T_EOF
@@ -33,7 +33,7 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN ON AS EXIT HELP TXN_BEGIN 
 %token <sv_bool> VALUE_BOOL
 
 // specify types for non-terminal symbol
-%type <sv_node> stmt dbStmt ddl dml txnStmt setStmt
+%type <sv_node> stmt dbStmt ddl dml txnStmt setStmt explainStmt
 %type <sv_field> field
 %type <sv_fields> fieldList
 %type <sv_type_len> type
@@ -45,7 +45,7 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN ON AS EXIT HELP TXN_BEGIN 
 %type <sv_strs> colNameList
 %type <sv_col> col
 %type <sv_cols> colList selector
-%type <sv_table_ref> from_clause table_ref table_primary
+%type <sv_table_ref> from_clause joined_table table_primary
 %type <sv_set_clause> setClause
 %type <sv_set_clauses> setClauses
 %type <sv_cond> condition
@@ -85,6 +85,14 @@ stmt:
     |   dml
     |   txnStmt
     |   setStmt
+    |   explainStmt
+    ;
+
+explainStmt:
+        EXPLAIN dml
+    {
+        $$ = std::make_shared<ExplainStmt>($2);
+    }
     ;
 
 txnStmt:
@@ -353,16 +361,16 @@ selector:
     ;
 
 from_clause:
-        table_ref
-    ;
-
-table_ref:
-        table_primary
-    |   table_ref ',' table_primary
+        joined_table
+    |   from_clause ',' joined_table
     {
         $$ = std::make_shared<JoinExpr>($1, $3, std::vector<std::shared_ptr<BinaryExpr>>{}, INNER_JOIN);
     }
-    |   table_ref JOIN table_primary ON whereClause
+    ;
+
+joined_table:
+        table_primary
+    |   joined_table JOIN table_primary ON whereClause
     {
         $$ = std::make_shared<JoinExpr>($1, $3, $5, INNER_JOIN);
     }

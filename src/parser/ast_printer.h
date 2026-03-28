@@ -85,6 +85,9 @@ class TreePrinter {
             std::cout << "HELP\n";
         } else if (auto x = std::dynamic_pointer_cast<ShowTables> (node)) {
             std::cout << "SHOW_TABLES\n";
+        } else if (auto x = std::dynamic_pointer_cast<ExplainStmt> (node)) {
+            std::cout << "EXPLAIN\n";
+            print_node (x->statement, offset);
         } else if (auto x = std::dynamic_pointer_cast<CreateTable> (node)) {
             std::cout << "CREATE_TABLE\n";
             print_val (x->tab_name, offset);

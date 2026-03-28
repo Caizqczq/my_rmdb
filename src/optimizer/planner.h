@@ -15,6 +15,8 @@ See the Mulan PSL v2 for more details. */
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <set>
 #include <vector>
 
 #include "analyze/analyze.h"
@@ -53,19 +55,21 @@ class Planner {
     std::shared_ptr<Plan> physical_optimization (std::shared_ptr<Query> query, Context *context);
 
     std::shared_ptr<Plan> make_one_rel (std::shared_ptr<Query> query);
-    std::shared_ptr<Plan> make_one_rel (const std::shared_ptr<Query::JoinTreeNode> &jointree,
-                                        std::vector<Condition> &remaining_conds);
 
     std::shared_ptr<Plan> generate_sort_plan (std::shared_ptr<Query> query, std::shared_ptr<Plan> plan);
 
     std::shared_ptr<Plan> generate_select_plan (std::shared_ptr<Query> query, Context *context);
 
-    std::shared_ptr<Plan> generate_table_access_plan (const std::string &tab_name, std::vector<Condition> conds);
+    std::shared_ptr<Plan> generate_table_access_plan (const std::string &tab_name, const std::string &base_tab_name,
+                                                      std::vector<Condition> conds);
+    std::shared_ptr<Plan> build_table_plan (const std::string &tab_name, const std::string &base_tab_name,
+                                            std::vector<Condition> local_conds,
+                                            const std::vector<TabCol> &leaf_projection_cols, bool need_leaf_projection);
 
     PlanTag choose_join_plan_tag (const std::vector<Condition> &join_conds) const;
 
     // int get_indexNo(std::string tab_name, std::vector<Condition> curr_conds);
-    bool get_index_scan_info (std::string tab_name, const std::vector<Condition> &curr_conds,
+    bool get_index_scan_info (std::string tab_name, const std::string &base_tab_name, const std::vector<Condition> &curr_conds,
                               std::vector<std::string> &index_col_names, std::vector<IndexRange> &index_ranges);
 
     ColType interp_sv_type (ast::SvType sv_type) {

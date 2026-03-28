@@ -31,6 +31,8 @@ int main () {
         "select x.a, y.b from x, y where x.a = y.b and c = d;",
         "select x.a, y.b from x join y on x.a = y.b where c = d;",
         "select s.a, c.b from student s join class c on s.id = c.sid where s.score > 60;",
+        "select t1.x, t2.x from tb t1 join tb t2 on t1.x = t2.x;",
+        "explain select * from tb t1 join tb t2 on t1.x = t2.x;",
         "exit;",
         "help;",
         "",

@@ -40,6 +40,13 @@ struct ShowIndex : public TreeNode {
     }
 };
 
+struct ExplainStmt : public TreeNode {
+    std::shared_ptr<TreeNode> statement;
+
+    explicit ExplainStmt (std::shared_ptr<TreeNode> statement_) : statement (std::move (statement_)) {
+    }
+};
+
 struct TxnBegin : public TreeNode {};
 
 struct TxnCommit : public TreeNode {};

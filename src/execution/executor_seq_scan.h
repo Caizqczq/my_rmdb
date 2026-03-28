@@ -18,12 +18,11 @@ See the Mulan PSL v2 for more details. */
 
 class SeqScanExecutor : public AbstractExecutor {
     private:
-    std::string tab_name_;              // 表的名称
-    std::vector<Condition> conds_;      // scan的条件
+    std::string tab_name_;              // 逻辑表名/别名
+    std::string base_tab_name_;         // 真实基表名
     RmFileHandle *fh_;                  // 表的数据文件句柄
     std::vector<ColMeta> cols_;         // scan后生成的记录的字段
     size_t len_;                        // scan后生成的每条记录的长度
-    std::vector<Condition> fed_conds_;  // 同conds_，两个字段相同
 
     Rid rid_;
     std::unique_ptr<RecScan> scan_;  // table_iterator
@@ -31,18 +30,20 @@ class SeqScanExecutor : public AbstractExecutor {
     SmManager *sm_manager_;
 
     public:
-    SeqScanExecutor (SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, Context *context) {
+    SeqScanExecutor (SmManager *sm_manager, std::string tab_name, std::string base_tab_name, std::vector<Condition> conds,
+                     Context *context) {
         sm_manager_ = sm_manager;
         tab_name_ = std::move (tab_name);
-        conds_ = std::move (conds);
-        TabMeta &tab = sm_manager_->db_.get_table (tab_name_);
-        fh_ = sm_manager_->fhs_.at (tab_name_).get ();
+        base_tab_name_ = std::move (base_tab_name);
+        TabMeta &tab = sm_manager_->db_.get_table (base_tab_name_);
+        fh_ = sm_manager_->fhs_.at (base_tab_name_).get ();
         cols_ = tab.cols;
+        for (auto &col : cols_) {
+            col.tab_name = tab_name_;
+        }
         len_ = cols_.back ().offset + cols_.back ().len;
 
         context_ = context;
-
-        fed_conds_ = conds_;
     }
 
     const std::vector<ColMeta> &cols () const override {
@@ -82,15 +83,11 @@ class SeqScanExecutor : public AbstractExecutor {
         while (!scan_->is_end ()) {
             rid_ = scan_->rid ();
             auto rec = fh_->get_record (rid_, context_);
-            if (check_conds (rec.get ())) {
+            if (rec != nullptr) {
                 return;
             }
             scan_->next ();
         }
-    }
-
-    bool check_conds (RmRecord *rec) {
-        return evaluate_conditions (cols_, rec, fed_conds_);
     }
 
     Rid &rid () override {
