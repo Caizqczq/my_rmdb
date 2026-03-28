@@ -25,6 +25,7 @@ std::shared_ptr<Query> Analyze::do_analyze (std::shared_ptr<ast::TreeNode> parse
                 throw TableNotFoundError (tab_name);
             }
         }
+        query->jointree = build_join_tree (query->tables);
 
         // 处理target list，再target list中添加上表名，例如 a.id
         for (auto &sv_sel_col : x->cols) {
@@ -85,6 +86,30 @@ std::shared_ptr<Query> Analyze::do_analyze (std::shared_ptr<ast::TreeNode> parse
     }
     query->parse = std::move (parse);
     return query;
+}
+
+std::shared_ptr<Query::JoinTreeNode> Analyze::build_join_tree (const std::vector<std::string> &tab_names) const {
+    if (tab_names.empty ()) {
+        return nullptr;
+    }
+
+    auto make_leaf = [] (const std::string &tab_name) {
+        auto node = std::make_shared<Query::JoinTreeNode> ();
+        node->table_name = tab_name;
+        node->tables.push_back (tab_name);
+        return node;
+    };
+
+    std::shared_ptr<Query::JoinTreeNode> root = make_leaf (tab_names.front ());
+    for (size_t i = 1; i < tab_names.size (); ++i) {
+        auto parent = std::make_shared<Query::JoinTreeNode> ();
+        parent->left = std::move (root);
+        parent->right = make_leaf (tab_names[i]);
+        parent->tables = parent->left->tables;
+        parent->tables.insert (parent->tables.end (), parent->right->tables.begin (), parent->right->tables.end ());
+        root = std::move (parent);
+    }
+    return root;
 }
 
 TabCol Analyze::check_column (const std::vector<ColMeta> &all_cols, TabCol target) {

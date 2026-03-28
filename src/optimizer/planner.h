@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <cassert>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -52,10 +53,16 @@ class Planner {
     std::shared_ptr<Plan> physical_optimization (std::shared_ptr<Query> query, Context *context);
 
     std::shared_ptr<Plan> make_one_rel (std::shared_ptr<Query> query);
+    std::shared_ptr<Plan> make_one_rel (const std::shared_ptr<Query::JoinTreeNode> &jointree,
+                                        std::vector<Condition> &remaining_conds);
 
     std::shared_ptr<Plan> generate_sort_plan (std::shared_ptr<Query> query, std::shared_ptr<Plan> plan);
 
     std::shared_ptr<Plan> generate_select_plan (std::shared_ptr<Query> query, Context *context);
+
+    std::shared_ptr<Plan> generate_table_access_plan (const std::string &tab_name, std::vector<Condition> conds);
+
+    PlanTag choose_join_plan_tag (const std::vector<Condition> &join_conds) const;
 
     // int get_indexNo(std::string tab_name, std::vector<Condition> curr_conds);
     bool get_index_scan_info (std::string tab_name, const std::vector<Condition> &curr_conds,

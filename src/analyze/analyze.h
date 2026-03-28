@@ -22,8 +22,20 @@ See the Mulan PSL v2 for more details. */
 
 class Query {
     public:
+    struct JoinTreeNode {
+        std::string table_name;
+        JoinType join_type = INNER_JOIN;
+        std::shared_ptr<JoinTreeNode> left;
+        std::shared_ptr<JoinTreeNode> right;
+        std::vector<std::string> tables;
+
+        bool is_leaf () const {
+            return left == nullptr && right == nullptr;
+        }
+    };
+
     std::shared_ptr<ast::TreeNode> parse;
-    // TODO jointree
+    std::shared_ptr<JoinTreeNode> jointree;
     // where条件
     std::vector<Condition> conds;
     // 投影列
@@ -56,6 +68,7 @@ class Analyze {
     void get_all_cols (const std::vector<std::string> &tab_names, std::vector<ColMeta> &all_cols);
     void get_clause (const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds, std::vector<Condition> &conds);
     void check_clause (const std::vector<std::string> &tab_names, std::vector<Condition> &conds);
+    std::shared_ptr<Query::JoinTreeNode> build_join_tree (const std::vector<std::string> &tab_names) const;
     Value convert_sv_value (const std::shared_ptr<ast::Value> &sv_val);
     CompOp convert_sv_comp_op (ast::SvCompOp op);
 };
