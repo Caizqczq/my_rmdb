@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstring>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "common/common.h"
@@ -28,6 +29,7 @@ class Query {
         std::shared_ptr<JoinTreeNode> left;
         std::shared_ptr<JoinTreeNode> right;
         std::vector<std::string> tables;
+        std::vector<Condition> join_conds;
 
         bool is_leaf () const {
             return left == nullptr && right == nullptr;
@@ -64,11 +66,18 @@ class Analyze {
     std::shared_ptr<Query> do_analyze (std::shared_ptr<ast::TreeNode> root);
 
     private:
-    TabCol check_column (const std::vector<ColMeta> &all_cols, TabCol target);
-    void get_all_cols (const std::vector<std::string> &tab_names, std::vector<ColMeta> &all_cols);
-    void get_clause (const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds, std::vector<Condition> &conds);
-    void check_clause (const std::vector<std::string> &tab_names, std::vector<Condition> &conds);
-    std::shared_ptr<Query::JoinTreeNode> build_join_tree (const std::vector<std::string> &tab_names) const;
-    Value convert_sv_value (const std::shared_ptr<ast::Value> &sv_val);
-    CompOp convert_sv_comp_op (ast::SvCompOp op);
+    TabCol check_column (const std::vector<ColMeta> &all_cols, TabCol target,
+                         const std::unordered_map<std::string, std::string> &alias_to_table = {}) const;
+    void get_all_cols (const std::vector<std::string> &tab_names, std::vector<ColMeta> &all_cols) const;
+    void get_clause (const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds, std::vector<Condition> &conds) const;
+    void check_clause (const std::vector<std::string> &tab_names, std::vector<Condition> &conds,
+                       const std::unordered_map<std::string, std::string> &alias_to_table = {}) const;
+    void collect_table_refs (const std::shared_ptr<ast::TableRef> &table_ref,
+                             std::vector<std::string> &tab_names,
+                             std::unordered_map<std::string, std::string> &alias_to_table) const;
+    std::shared_ptr<Query::JoinTreeNode> build_join_tree (
+        const std::shared_ptr<ast::TableRef> &table_ref,
+        const std::unordered_map<std::string, std::string> &alias_to_table) const;
+    Value convert_sv_value (const std::shared_ptr<ast::Value> &sv_val) const;
+    CompOp convert_sv_comp_op (ast::SvCompOp op) const;
 };

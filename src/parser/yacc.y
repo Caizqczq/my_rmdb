@@ -22,7 +22,7 @@ using namespace ast;
 
 // keywords
 %token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY
-WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE
+WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN ON AS EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE
 // non-keywords
 %token LEQ NEQ GEQ T_EOF
 
@@ -42,9 +42,10 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN EXIT HELP TXN_BEGIN TXN_CO
 %type <sv_val> value
 %type <sv_vals> valueList
 %type <sv_str> tbName colName
-%type <sv_strs> tableList colNameList
+%type <sv_strs> colNameList
 %type <sv_col> col
 %type <sv_cols> colList selector
+%type <sv_table_ref> from_clause table_ref table_primary
 %type <sv_set_clause> setClause
 %type <sv_set_clauses> setClauses
 %type <sv_cond> condition
@@ -52,6 +53,7 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN EXIT HELP TXN_BEGIN TXN_CO
 %type <sv_orderby>  order_clause opt_order_clause
 %type <sv_orderby_dir> opt_asc_desc
 %type <sv_setKnobType> set_knob_type
+%type <sv_str> opt_alias
 
 %%
 start:
@@ -158,7 +160,7 @@ dml:
     {
         $$ = std::make_shared<UpdateStmt>($2, $4, $5);
     }
-    |   SELECT selector FROM tableList optWhereClause opt_order_clause
+    |   SELECT selector FROM from_clause optWhereClause opt_order_clause
     {
         $$ = std::make_shared<SelectStmt>($2, $4, $5, $6);
     }
@@ -350,18 +352,41 @@ selector:
     |   colList
     ;
 
-tableList:
-        tbName
+from_clause:
+        table_ref
+    ;
+
+table_ref:
+        table_primary
+    |   table_ref ',' table_primary
     {
-        $$ = std::vector<std::string>{$1};
+        $$ = std::make_shared<JoinExpr>($1, $3, std::vector<std::shared_ptr<BinaryExpr>>{}, INNER_JOIN);
     }
-    |   tableList ',' tbName
+    |   table_ref JOIN table_primary ON whereClause
     {
-        $$.push_back($3);
+        $$ = std::make_shared<JoinExpr>($1, $3, $5, INNER_JOIN);
     }
-    |   tableList JOIN tbName
+    ;
+
+table_primary:
+        tbName opt_alias
     {
-        $$.push_back($3);
+        $$ = std::make_shared<TableFactor>($1, $2);
+    }
+    ;
+
+opt_alias:
+        /* epsilon */
+    {
+        $$ = "";
+    }
+    |   IDENTIFIER
+    {
+        $$ = $1;
+    }
+    |   AS IDENTIFIER
+    {
+        $$ = $2;
     }
     ;
 

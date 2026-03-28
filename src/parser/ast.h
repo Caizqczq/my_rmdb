@@ -176,6 +176,16 @@ struct OrderBy : public TreeNode {
     }
 };
 
+struct TableRef : public TreeNode {};
+
+struct TableFactor : public TableRef {
+    std::string tab_name;
+    std::string alias;
+
+    TableFactor (std::string tab_name_, std::string alias_) : tab_name (std::move (tab_name_)), alias (std::move (alias_)) {
+    }
+};
+
 struct InsertStmt : public TreeNode {
     std::string tab_name;
     std::vector<std::shared_ptr<Value>> vals;
@@ -205,29 +215,29 @@ struct UpdateStmt : public TreeNode {
     }
 };
 
-struct JoinExpr : public TreeNode {
-    std::string left;
-    std::string right;
+struct JoinExpr : public TableRef {
+    std::shared_ptr<TableRef> left;
+    std::shared_ptr<TableRef> right;
     std::vector<std::shared_ptr<BinaryExpr>> conds;
     JoinType type;
 
-    JoinExpr (std::string left_, std::string right_, std::vector<std::shared_ptr<BinaryExpr>> conds_, JoinType type_)
+    JoinExpr (std::shared_ptr<TableRef> left_, std::shared_ptr<TableRef> right_,
+              std::vector<std::shared_ptr<BinaryExpr>> conds_, JoinType type_)
         : left (std::move (left_)), right (std::move (right_)), conds (std::move (conds_)), type (type_) {
     }
 };
 
 struct SelectStmt : public TreeNode {
     std::vector<std::shared_ptr<Col>> cols;
-    std::vector<std::string> tabs;
+    std::shared_ptr<TableRef> from;
     std::vector<std::shared_ptr<BinaryExpr>> conds;
-    std::vector<std::shared_ptr<JoinExpr>> jointree;
 
     bool has_sort;
     std::shared_ptr<OrderBy> order;
 
-    SelectStmt (std::vector<std::shared_ptr<Col>> cols_, std::vector<std::string> tabs_,
+    SelectStmt (std::vector<std::shared_ptr<Col>> cols_, std::shared_ptr<TableRef> from_,
                 std::vector<std::shared_ptr<BinaryExpr>> conds_, std::shared_ptr<OrderBy> order_)
-        : cols (std::move (cols_)), tabs (std::move (tabs_)), conds (std::move (conds_)), order (std::move (order_)) {
+        : cols (std::move (cols_)), from (std::move (from_)), conds (std::move (conds_)), order (std::move (order_)) {
         has_sort = (bool)order;
     }
 };
@@ -266,6 +276,8 @@ struct SemValue {
 
     std::shared_ptr<Col> sv_col;
     std::vector<std::shared_ptr<Col>> sv_cols;
+
+    std::shared_ptr<TableRef> sv_table_ref;
 
     std::shared_ptr<SetClause> sv_set_clause;
     std::vector<std::shared_ptr<SetClause>> sv_set_clauses;

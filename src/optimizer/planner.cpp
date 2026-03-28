@@ -487,9 +487,13 @@ std::shared_ptr<Plan> Planner::make_one_rel (const std::shared_ptr<Query::JoinTr
 
     std::shared_ptr<Plan> left = make_one_rel (jointree->left, remaining_conds);
     std::shared_ptr<Plan> right = make_one_rel (jointree->right, remaining_conds);
-    auto join_conds = extract_join_conditions (remaining_conds, jointree->left->tables, jointree->right->tables);
-    return std::make_shared<JoinPlan> (choose_join_plan_tag (join_conds), std::move (left), std::move (right),
-                                       std::move (join_conds));
+    std::vector<Condition> join_conds = jointree->join_conds;
+    auto where_join_conds = extract_join_conditions (remaining_conds, jointree->left->tables, jointree->right->tables);
+    join_conds.insert (join_conds.end (), where_join_conds.begin (), where_join_conds.end ());
+    auto plan = std::make_shared<JoinPlan> (choose_join_plan_tag (join_conds), std::move (left), std::move (right),
+                                            std::move (join_conds));
+    plan->type = jointree->join_type;
+    return plan;
 }
 
 std::shared_ptr<Plan> Planner::generate_sort_plan (std::shared_ptr<Query> query, std::shared_ptr<Plan> plan) {

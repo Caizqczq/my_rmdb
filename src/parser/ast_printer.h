@@ -68,6 +68,16 @@ class TreePrinter {
         }
     }
 
+    static std::string join_type2str (JoinType type) {
+        static std::map<JoinType, std::string> m{
+            {INNER_JOIN, "INNER_JOIN"},
+            {LEFT_JOIN, "LEFT_JOIN"},
+            {RIGHT_JOIN, "RIGHT_JOIN"},
+            {FULL_JOIN, "FULL_JOIN"},
+        };
+        return m.at (type);
+    }
+
     static void print_node (const std::shared_ptr<TreeNode> &node, int offset) {
         std::cout << offset2string (offset);
         offset += 2;
@@ -125,6 +135,16 @@ class TreePrinter {
             print_node (x->lhs, offset);
             print_val (op2str (x->op), offset);
             print_node (x->rhs, offset);
+        } else if (auto x = std::dynamic_pointer_cast<TableFactor> (node)) {
+            std::cout << "TABLE\n";
+            print_val (x->tab_name, offset);
+            print_val (x->alias, offset);
+        } else if (auto x = std::dynamic_pointer_cast<JoinExpr> (node)) {
+            std::cout << "JOIN\n";
+            print_val (join_type2str (x->type), offset);
+            print_node (x->left, offset);
+            print_node (x->right, offset);
+            print_node_list (x->conds, offset);
         } else if (auto x = std::dynamic_pointer_cast<InsertStmt> (node)) {
             std::cout << "INSERT\n";
             print_val (x->tab_name, offset);
@@ -141,7 +161,7 @@ class TreePrinter {
         } else if (auto x = std::dynamic_pointer_cast<SelectStmt> (node)) {
             std::cout << "SELECT\n";
             print_node_list (x->cols, offset);
-            print_val_list (x->tabs, offset);
+            print_node (x->from, offset);
             print_node_list (x->conds, offset);
         } else if (auto x = std::dynamic_pointer_cast<TxnBegin> (node)) {
             std::cout << "BEGIN\n";
